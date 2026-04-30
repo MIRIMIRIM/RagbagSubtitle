@@ -1,0 +1,15 @@
+{
+  "name": "ragbag-subtitle",
+  "version-string": "0.1.0-dev",
+  "description": "Dynamic subtitle provider experiments for Aegisub.",
+  "dependencies": [
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": [
+        "avcodec",
+        "avformat"
+      ]
+    }
+  ]
+}

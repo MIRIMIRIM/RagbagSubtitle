@@ -1,0 +1,22 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "windows-vcpkg",
+      "displayName": "Windows vcpkg",
+      "description": "Use the local F:/vcpkg toolchain and install the minimal FFmpeg features declared in vcpkg.json.",
+      "binaryDir": "${sourceDir}/build/windows-vcpkg",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "F:/vcpkg/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_TARGET_TRIPLET": "x64-windows-static",
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-vcpkg",
+      "configurePreset": "windows-vcpkg"
+    }
+  ]
+}
