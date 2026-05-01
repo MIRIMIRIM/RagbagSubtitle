@@ -1,5 +1,5 @@
 // Copyright (c) 2026
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 #include "ragbag/subtitle_plugin_api.h"
 

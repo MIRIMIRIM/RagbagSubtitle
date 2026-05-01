@@ -1,5 +1,5 @@
 // Copyright (c) 2026
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 #pragma once
 
@@ -105,7 +105,7 @@ typedef struct RagbagSubtitleOverlayTargetV0 {
     RagbagSubtitlePixelFormatV0 pixel_format;
     RagbagSubtitleAlphaModeV0 alpha_mode;
     uint8_t *plane0;
-    int32_t stride0;
+    int32_t stride0;      // bytes per row; negative = bottom-up (flipped)
     int32_t width;
     int32_t height;
     RagbagSubtitleDirtyRectV0 *dirty_rects;

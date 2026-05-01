@@ -1,5 +1,5 @@
 // Copyright (c) 2026
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 #include "ffmpeg_subtitle_provider.h"
 
@@ -16,11 +16,11 @@ RagbagSubtitleHostApiV0 g_host = {};
 
 RagbagSubtitleProviderDescriptorV0 const g_provider_descriptor = {
     sizeof(RagbagSubtitleProviderDescriptorV0),
-    "ragbag.ffmpeg.subtitle",
-    "Ragbag FFmpeg Subtitle Provider",
-    "Ragbag/FFmpeg",
-    ".sup;.pgs;.idx;.sub;.mks;.mkv;.mp4;.webm",
-    "hdmv_pgs_subtitle;dvd_subtitle;dvb_subtitle;xsub",
+    "ragbag.subtitle",
+    "Ragbag Subtitle",
+    "Ragbag/Subtitle",
+    ".sup;.pgs",
+    "hdmv_pgs_subtitle",
     RAGBAG_SUBTITLE_PROVIDER_CAP_FILE_INPUT
         | RAGBAG_SUBTITLE_PROVIDER_CAP_BITMAP_OUTPUT
         | RAGBAG_SUBTITLE_PROVIDER_CAP_DIRTY_RECTS
@@ -94,10 +94,10 @@ RAGBAG_SUBTITLE_PLUGIN_EXPORT int32_t ragbag_subtitle_plugin_init_v0(
     std::memset(plugin, 0, output_size);
     plugin->struct_size = sizeof(RagbagSubtitlePluginApiV0);
     plugin->api_version = RAGBAG_SUBTITLE_PLUGIN_API_VERSION;
-    plugin->plugin_id = "org.ragbag.subtitle.ffmpeg";
-    plugin->plugin_name = "Ragbag Subtitle FFmpeg Provider";
+    plugin->plugin_id = "org.ragbag.subtitle";
+    plugin->plugin_name = "Ragbag Subtitle Provider";
     plugin->plugin_version = "0.1.0-dev";
-    plugin->plugin_license = "MIT for plugin glue; FFmpeg license depends on the linked FFmpeg build";
+    plugin->plugin_license = "LGPL-2.1-or-later (plugin glue and statically linked FFmpeg)";
     plugin->get_provider_count = GetProviderCount;
     plugin->get_provider_descriptor = GetProviderDescriptor;
     plugin->create_provider = CreateProvider;

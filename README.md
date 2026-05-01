@@ -7,7 +7,7 @@ The C API is intentionally versioned as `v0`. It is allowed to change aggressive
 ## Current shape
 
 - One dynamic library target: `ragbag-subtitle-ffmpeg`.
-- One provider descriptor: `ragbag.ffmpeg.subtitle`.
+- One provider descriptor: `ragbag.subtitle`.
 - Input: file-backed subtitles through libavformat.
 - Decode: libavcodec subtitle decoders.
 - Output: BGRA8 premultiplied overlay rects rendered into a host-provided target.
@@ -33,11 +33,11 @@ $cmake = 'C:/Program Files/Microsoft Visual Studio/18/Community/Common7/IDE/Comm
 & $cmake --build --preset windows-vcpkg --config RelWithDebInfo
 ```
 
-The installed plugin is intended to live under Aegisub's executable-relative `subtitle_plugins` directory, matching the existing `native_library` app-local loading style.
+The installed plugin is intended to live under Aegisub's executable-relative `runtimes` directory, matching the existing `native_library` app-local loading style.
 
 ```powershell
 Copy-Item build/windows-vcpkg/RelWithDebInfo/ragbag-subtitle-ffmpeg.dll `
-  F:/GitHub/Aegisub_wangqr/build-relwithdebinfo-x64/RelWithDebInfo/subtitle_plugins/
+  F:/GitHub/Aegisub_wangqr/build-relwithdebinfo-x64/RelWithDebInfo/runtimes/
 ```
 
 You can verify that the plugin does not depend on FFmpeg DLLs with:
@@ -50,15 +50,17 @@ The expected non-CRT dependencies are Windows system libraries such as
 `Secur32.dll`, `ncrypt.dll`, `CRYPT32.dll`, `WS2_32.dll`, `ole32.dll`,
 `USER32.dll`, and `KERNEL32.dll`.
 
-## Licensing note
+## Licensing
 
-The plugin glue is MIT-licensed, but the FFmpeg build installed by vcpkg declares
-`LGPL-2.1-or-later`. Static linking can impose additional LGPL obligations for
-redistribution, including providing license notices, FFmpeg source or written
-source offer as applicable, and a practical way for recipients to relink or
-replace the LGPL-covered components. This repository currently treats the static
-single-DLL build as a local development artifact; release packaging must make an
-explicit licensing decision before shipping binaries.
+The plugin glue and statically linked FFmpeg components are distributed under
+**LGPL-2.1-or-later**. Static linking of FFmpeg means the combined plugin DLL is
+an LGPL-covered work. Redistribution must comply with LGPL obligations:
+- Provide license notices and a copy of LGPL-2.1.
+- Provide FFmpeg source or a written offer for source for at least three years.
+- Ensure recipients can relink or replace the LGPL-covered library components.
+This repository currently treats the static single-DLL build as a local
+development artifact; release packaging must make an explicit licensing decision
+before shipping binaries.
 
 ## Provider model
 
