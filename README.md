@@ -1,31 +1,32 @@
 # RagbagSubtitle
 
-RagbagSubtitle is a development playground for dynamic subtitle providers intended to be loaded by Aegisub through its native library loader. The first provider is a generic FFmpeg/libavformat subtitle provider. It is not PGS-specific: it declares the file extensions and codec families it can attempt, then demuxes and decodes through FFmpeg.
+RagbagSubtitle is a packet-backed bitmap subtitle decoder loaded by Aegisub for its secondary subtitle strip. Aegisub owns files, Matroska containers, track selection, demuxing, timestamps, and packet delivery. Ragbag owns only codec decode state, the decoded bitmap timeline, and rendering into host-provided storage.
 
-The C API is intentionally versioned as `v0`. It is allowed to change aggressively while the Aegisub host side and the plugin mature.
+The C API is intentionally versioned as `v1`. It remains an internal contract shared with Aegisub and may change while the two sides mature together.
 
 ## Current shape
 
 - One dynamic library target: `ragbag-subtitle-ffmpeg`.
-- One provider descriptor: `ragbag.subtitle`.
-- Input: file-backed subtitles through libavformat.
-- Decode: libavcodec subtitle decoders.
-- Output: BGRA8 premultiplied overlay rects rendered into a host-provided target.
-- Initial target formats: PGS/SUP and other FFmpeg bitmap subtitle formats as they become wired up.
+- One decoder descriptor: `ragbag.pgs`.
+- Input: host-demuxed `hdmv-pgs` packet streams with nanosecond timestamps.
+- Decode: the libavcodec PGS decoder; libavformat is deliberately not linked
+  (libavutil and libswresample remain libavcodec dependencies).
+- Output: a fully overwritten host-owned BGRA8 premultiplied target.
+- Scope: Aegisub secondary subtitles only. This is not a document or primary-subtitle renderer API.
 
 ## Build
 
 The repository uses a vcpkg manifest with minimal FFmpeg features:
 
 ```json
-ffmpeg[avcodec,avformat]
+ffmpeg[avcodec]
 ```
 
 On this machine the expected vcpkg root is `F:/vcpkg`. The Windows preset uses
 `x64-windows-static` so the FFmpeg libraries are statically linked into the
 plugin DLL. The runtime artifact is therefore intended to be a single plugin DLL
-plus system DLLs already provided by Windows, not a bundle of `avcodec-*.dll`,
-`avformat-*.dll`, and `avutil-*.dll`.
+plus system DLLs already provided by Windows, not a bundle of `avcodec-*.dll`
+and `avutil-*.dll`.
 
 ```powershell
 $cmake = 'C:/Program Files/Microsoft Visual Studio/18/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe'
@@ -33,17 +34,33 @@ $cmake = 'C:/Program Files/Microsoft Visual Studio/18/Community/Common7/IDE/Comm
 & $cmake --build --preset windows-vcpkg --config RelWithDebInfo
 ```
 
+For a preinstalled package without pkg-config, set `RAGBAG_FFMPEG_ROOT` to the
+package root containing `include/libavcodec` and `lib` (or `lib64`). CMake
+resolves the platform-native `avcodec`, `avutil`, and `swresample` library
+files explicitly and fails during configuration if any are missing. A broad
+`find_package(FFMPEG)` fallback is intentionally not used because such modules
+may silently add libavformat and break the decoder-only boundary.
+
 The installed plugin is intended to live under Aegisub's executable-relative `runtimes` directory, matching the existing `native_library` app-local loading style.
 
 ```powershell
 Copy-Item build/windows-vcpkg/RelWithDebInfo/ragbag-subtitle-ffmpeg.dll `
-  F:/GitHub/Aegisub_wangqr/build-relwithdebinfo-x64/RelWithDebInfo/runtimes/
+  F:/GitHub/Aegisub_wangqr/build-dir/RelWithDebInfo/runtimes/
 ```
 
 You can verify that the plugin does not depend on FFmpeg DLLs with:
 
 ```powershell
 dumpbin /dependents build/windows-vcpkg/RelWithDebInfo/ragbag-subtitle-ffmpeg.dll
+```
+
+When `BUILD_TESTING` is enabled, the decoder lifecycle probe is registered with
+CTest and covers invalid stride rejection, transparent clearing, non-integer
+canvas scaling, empty-display clearing, and discontinuity handling:
+
+```powershell
+& $cmake --build --preset windows-vcpkg --config RelWithDebInfo
+ctest --test-dir build/windows-vcpkg -C RelWithDebInfo --output-on-failure
 ```
 
 The expected non-CRT dependencies are Windows system libraries such as
@@ -62,10 +79,14 @@ This repository currently treats the static single-DLL build as a local
 development artifact; release packaging must make an explicit licensing decision
 before shipping binaries.
 
-## Provider model
+## Decoder model
 
-A plugin does not need to register one factory per subtitle format. A single provider may declare multiple extensions/codecs and dispatch internally. Register separate provider descriptors only when the host should expose distinct user choices, when dependencies differ, or when lifecycle/rendering behavior differs enough to matter.
+The v1 ABI accepts a complete packet stream before random-access rendering begins. Packet payload memory is borrowed only for the duration of `push_packet`; the decoder retains its own timeline. Sessions are single-threaded, while independent sessions may run concurrently. File extensions and container codec IDs are intentionally absent from the decoder contract.
+
+### Resolution and scaling
+
+PGS carries an authored composition resolution in its presentation composition segment. The FFmpeg decoder exposes that value through its codec context and Ragbag records it with each decoded event. The host-provided fallback is used only for malformed streams without a declared canvas. When the target differs from the authored canvas, Ragbag uses nearest-neighbour sampling so palette edges are not blurred.
 
 ## HDR and color
 
-The plugin should decode subtitle data and provide color metadata when available. HDR tone mapping, gamut mapping, subtitle brightness policy, and compose-before/after-tonemap decisions belong in the Aegisub renderer/compositor layer because that layer knows the video frame, output target, and user settings.
+The v1 output is deliberately fixed to SDR-style premultiplied BGRA8 because it is consumed by Aegisub's secondary subtitle strip. HDR tone mapping, gamut mapping, and primary-video composition are outside this decoder's scope.

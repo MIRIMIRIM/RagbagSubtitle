@@ -10,16 +10,18 @@
 
 namespace ragbag {
 
-class FfmpegSubtitleProvider;
+class FfmpegBitmapSubtitleDecoder;
 
-std::unique_ptr<FfmpegSubtitleProvider> CreateFfmpegSubtitleProvider();
+std::unique_ptr<FfmpegBitmapSubtitleDecoder> CreateFfmpegBitmapSubtitleDecoder();
 
-class FfmpegSubtitleProvider {
+class FfmpegBitmapSubtitleDecoder {
 public:
-    virtual ~FfmpegSubtitleProvider() = default;
+    virtual ~FfmpegBitmapSubtitleDecoder() = default;
     virtual char const *LastError() const = 0;
-    virtual int OpenFile(char const *path_utf8, RagbagSubtitleVideoInfoV0 const *video_hint) = 0;
-    virtual int RenderOverlay(RagbagSubtitleRenderRequestV0 const *request, RagbagSubtitleOverlayTargetV0 *target) = 0;
+    virtual int BeginStream(RagbagSubtitleStreamInfoV1 const *stream) = 0;
+    virtual int PushPacket(RagbagSubtitlePacketV1 const *packet) = 0;
+    virtual int EndStream() = 0;
+    virtual int RenderAt(int64_t time_ns, RagbagSubtitleRenderTargetV1 *target, RagbagSubtitleRenderResultV1 *result) = 0;
 };
 
 } // namespace ragbag

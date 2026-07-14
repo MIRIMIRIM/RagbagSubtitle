@@ -4,8 +4,10 @@
 #include "ffmpeg_subtitle_provider.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <string>
@@ -18,8 +20,9 @@ extern "C" {
 #pragma warning(disable: 4244)
 #endif
 #include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
 #include <libavutil/error.h>
+#include <libavutil/mathematics.h>
+#include <libavutil/mem.h>
 #include <libavutil/rational.h>
 #ifdef _MSC_VER
 #pragma warning(pop)
@@ -36,25 +39,30 @@ struct BgraPixel {
     uint8_t a = 0;
 };
 
+// PGS and most FFmpeg bitmap subtitles decode to a palettized (PAL8) image: a
+// byte index per pixel plus a small RGBA palette. Keeping that native layout in
+// memory (index + palette) instead of expanding to 4 bytes/pixel BGRA cuts the
+// resident footprint by ~4x. The palette is stored pre-multiplied so blend math
+// is unchanged.
 struct BitmapRect {
     int x = 0;
     int y = 0;
     int width = 0;
     int height = 0;
-    std::vector<BgraPixel> pixels;
+    int visible_x0 = 0;
+    int visible_y0 = 0;
+    int visible_x1 = 0;
+    int visible_y1 = 0;
+    std::vector<uint8_t> indices;  // width * height entries, PAL8 index into palette
+    BgraPixel palette[256] = {};
 };
 
 struct SubtitleEvent {
-    double start = 0.0;
-    double end = 0.0;
+    int64_t start_ns = 0;
+    int64_t end_ns = std::numeric_limits<int64_t>::max();
+    int authored_width = 0;
+    int authored_height = 0;
     std::vector<BitmapRect> rects;
-};
-
-struct FormatContextDeleter {
-    void operator()(AVFormatContext *ctx) const {
-        if (ctx)
-            avformat_close_input(&ctx);
-    }
 };
 
 struct CodecContextDeleter {
@@ -69,7 +77,6 @@ struct PacketDeleter {
     }
 };
 
-using FormatContextPtr = std::unique_ptr<AVFormatContext, FormatContextDeleter>;
 using CodecContextPtr = std::unique_ptr<AVCodecContext, CodecContextDeleter>;
 using PacketPtr = std::unique_ptr<AVPacket, PacketDeleter>;
 
@@ -79,16 +86,26 @@ std::string AvError(int error_code) {
     return buffer;
 }
 
-double TimestampToSeconds(int64_t value, AVRational time_base) {
-    if (value == AV_NOPTS_VALUE)
-        return std::numeric_limits<double>::quiet_NaN();
-    return static_cast<double>(value) * av_q2d(time_base);
+constexpr AVRational kNanosecondTimeBase = { 1, 1000000000 };
+
+int64_t NsToAvTime(int64_t value) {
+    if (value == RAGBAG_SUBTITLE_TIMESTAMP_UNKNOWN)
+        return AV_NOPTS_VALUE;
+    return av_rescale_q(value, kNanosecondTimeBase, AV_TIME_BASE_Q);
 }
 
-bool IsFiniteTime(double value) {
-    return value == value
-        && value > -std::numeric_limits<double>::infinity()
-        && value < std::numeric_limits<double>::infinity();
+int64_t AvTimeToNs(int64_t value) {
+    if (value == AV_NOPTS_VALUE)
+        return RAGBAG_SUBTITLE_TIMESTAMP_UNKNOWN;
+    return av_rescale_q(value, AV_TIME_BASE_Q, kNanosecondTimeBase);
+}
+
+int64_t SaturatingAdd(int64_t left, int64_t right) {
+    if (right > 0 && left > std::numeric_limits<int64_t>::max() - right)
+        return std::numeric_limits<int64_t>::max();
+    if (right < 0 && left < std::numeric_limits<int64_t>::min() - right)
+        return std::numeric_limits<int64_t>::min();
+    return left + right;
 }
 
 BgraPixel PremultiplyPaletteEntry(uint8_t const *entry) {
@@ -107,33 +124,64 @@ BgraPixel PremultiplyPaletteEntry(uint8_t const *entry) {
 bool ConvertBitmapRect(AVSubtitleRect const *rect, BitmapRect& out) {
     if (!rect || rect->type != SUBTITLE_BITMAP || rect->w <= 0 || rect->h <= 0)
         return false;
-    if (!rect->data[0] || !rect->data[1] || rect->linesize[0] <= 0 || rect->nb_colors <= 0)
+    if (!rect->data[0] || !rect->data[1] || rect->linesize[0] < rect->w || rect->nb_colors <= 0)
         return false;
 
     out.x = rect->x;
     out.y = rect->y;
     out.width = rect->w;
     out.height = rect->h;
-    out.pixels.assign(static_cast<size_t>(out.width) * out.height, {});
 
-    BgraPixel palette[256] = {};
     int const colors = std::min(rect->nb_colors, 256);
-    for (int i = 0; i < colors; ++i)
-        palette[i] = PremultiplyPaletteEntry(rect->data[1] + static_cast<size_t>(i) * 4);
-
-    for (int y = 0; y < out.height; ++y) {
-        auto const *src = rect->data[0] + static_cast<ptrdiff_t>(y) * rect->linesize[0];
-        auto *dst = out.pixels.data() + static_cast<size_t>(y) * out.width;
-        for (int x = 0; x < out.width; ++x)
-            dst[x] = palette[src[x]];
+    uint8_t visible_palette[256] = {};
+    for (int i = 0; i < colors; ++i) {
+        out.palette[i] = PremultiplyPaletteEntry(rect->data[1] + static_cast<size_t>(i) * 4);
+        visible_palette[i] = out.palette[i].a != 0 ? 1 : 0;
     }
 
+    // PAL8 index plane, copied verbatim. resize (not assign) so the buffer is
+    // only touched once; the loop below fully populates every byte.
+    out.indices.resize(static_cast<size_t>(out.width) * out.height);
+    int visible_x0 = out.width;
+    int visible_y0 = out.height;
+    int visible_x1 = 0;
+    int visible_y1 = 0;
+    for (int y = 0; y < out.height; ++y) {
+        auto const *src = rect->data[0] + static_cast<ptrdiff_t>(y) * rect->linesize[0];
+        auto *dst = out.indices.data() + static_cast<size_t>(y) * out.width;
+        std::memcpy(dst, src, static_cast<size_t>(out.width));
+        for (int x = 0; x < out.width; ++x) {
+            if (!visible_palette[dst[x]])
+                continue;
+            visible_x0 = std::min(visible_x0, x);
+            visible_y0 = std::min(visible_y0, y);
+            visible_x1 = std::max(visible_x1, x + 1);
+            visible_y1 = std::max(visible_y1, y + 1);
+        }
+    }
+
+    if (visible_x1 <= visible_x0 || visible_y1 <= visible_y0)
+        return false;
+
+    out.visible_x0 = visible_x0;
+    out.visible_y0 = visible_y0;
+    out.visible_x1 = visible_x1;
+    out.visible_y1 = visible_y1;
     return true;
 }
 
-void ClearTarget(RagbagSubtitleOverlayTargetV0& target) {
+void ClearTarget(RagbagSubtitleRenderTargetV1& target) {
     if (!target.plane0 || target.width <= 0 || target.height <= 0)
         return;
+
+    // Fast path: packed rows (no padding, top-down) -> one memset over the
+    // whole plane. Otherwise clear each row individually (also handles negative
+    // strides for bottom-up targets).
+    if (target.stride0 == target.width * 4 && target.stride0 > 0) {
+        std::memset(target.plane0, 0,
+            static_cast<size_t>(target.stride0) * static_cast<size_t>(target.height));
+        return;
+    }
 
     for (int y = 0; y < target.height; ++y) {
         auto *row = target.plane0 + static_cast<ptrdiff_t>(y) * target.stride0;
@@ -141,80 +189,211 @@ void ClearTarget(RagbagSubtitleOverlayTargetV0& target) {
     }
 }
 
-void AddDirtyRect(RagbagSubtitleOverlayTargetV0& target, int x, int y, int width, int height) {
-    if (!target.dirty_rects || target.dirty_rect_count >= target.dirty_rect_capacity)
-        return;
-    target.dirty_rects[target.dirty_rect_count++] = { x, y, width, height };
-}
-
 void BlendPixel(BgraPixel src, uint8_t *dst) {
     if (!src.a)
         return;
+    if (src.a == 255) {
+        dst[0] = src.b;
+        dst[1] = src.g;
+        dst[2] = src.r;
+        dst[3] = 255;
+        return;
+    }
 
     uint32_t const inv_alpha = 255 - src.a;
-    dst[0] = static_cast<uint8_t>(std::min<uint32_t>(255, src.b + (dst[0] * inv_alpha + 127) / 255));
-    dst[1] = static_cast<uint8_t>(std::min<uint32_t>(255, src.g + (dst[1] * inv_alpha + 127) / 255));
-    dst[2] = static_cast<uint8_t>(std::min<uint32_t>(255, src.r + (dst[2] * inv_alpha + 127) / 255));
-    dst[3] = static_cast<uint8_t>(std::min<uint32_t>(255, src.a + (dst[3] * inv_alpha + 127) / 255));
+    dst[0] = static_cast<uint8_t>(src.b + (dst[0] * inv_alpha + 127) / 255);
+    dst[1] = static_cast<uint8_t>(src.g + (dst[1] * inv_alpha + 127) / 255);
+    dst[2] = static_cast<uint8_t>(src.r + (dst[2] * inv_alpha + 127) / 255);
+    dst[3] = static_cast<uint8_t>(src.a + (dst[3] * inv_alpha + 127) / 255);
 }
 
-void BlendRect(BitmapRect const& rect, RagbagSubtitleOverlayTargetV0& target) {
-    int const x0 = std::max(0, rect.x);
-    int const y0 = std::max(0, rect.y);
-    int const x1 = std::min(target.width, rect.x + rect.width);
-    int const y1 = std::min(target.height, rect.y + rect.height);
-    if (x0 >= x1 || y0 >= y1)
-        return;
+void StorePixel(BgraPixel src, uint8_t *dst) {
+    dst[0] = src.b;
+    dst[1] = src.g;
+    dst[2] = src.r;
+    dst[3] = src.a;
+}
 
+int ScaleBoundaryToTarget(int64_t value, int target_extent, int authored_extent) {
+    long double const scaled = static_cast<long double>(value)
+        * static_cast<long double>(target_extent)
+        / static_cast<long double>(authored_extent);
+    if (scaled <= 0.0L)
+        return 0;
+    if (scaled >= static_cast<long double>(target_extent))
+        return target_extent;
+    return static_cast<int>(std::ceil(scaled));
+}
+
+// Blends one authored bitmap rect into the target. When the authored and target
+// canvases match the rect is sampled 1:1; otherwise it is scaled with
+// nearest-neighbour sampling. Nearest is appropriate for palette graphics
+// (PGS/VOBsub/DVB): bilinear on pre-multiplied color+alpha would smear edges
+// and bleed transparent palette entries.
+bool BlendRect(BitmapRect const& rect, RagbagSubtitleRenderTargetV1& target, int authored_width, int authored_height, bool copy_to_clear_target) {
+    if (authored_width <= 0 || authored_height <= 0)
+        return false;
+
+    bool const identity = target.width == authored_width && target.height == authored_height;
+
+    auto const map_x = [&](int64_t value) {
+        return identity
+            ? static_cast<int>(std::clamp<int64_t>(value, 0, target.width))
+            : ScaleBoundaryToTarget(value, target.width, authored_width);
+    };
+    auto const map_y = [&](int64_t value) {
+        return identity
+            ? static_cast<int>(std::clamp<int64_t>(value, 0, target.height))
+            : ScaleBoundaryToTarget(value, target.height, authored_height);
+    };
+
+    // Map absolute authored-canvas edges rather than scaling rect origin and
+    // size independently. This keeps adjacent objects contiguous and makes the
+    // sampling grid consistent across the entire composition.
+    int const whole_x0 = map_x(rect.x);
+    int const whole_y0 = map_y(rect.y);
+    int const whole_x1 = map_x(static_cast<int64_t>(rect.x) + rect.width);
+    int const whole_y1 = map_y(static_cast<int64_t>(rect.y) + rect.height);
+    int const visible_x0 = map_x(static_cast<int64_t>(rect.x) + rect.visible_x0);
+    int const visible_y0 = map_y(static_cast<int64_t>(rect.y) + rect.visible_y0);
+    int const visible_x1 = map_x(static_cast<int64_t>(rect.x) + rect.visible_x1);
+    int const visible_y1 = map_y(static_cast<int64_t>(rect.y) + rect.visible_y1);
+
+    int const x0 = std::max(whole_x0, visible_x0);
+    int const y0 = std::max(whole_y0, visible_y0);
+    int const x1 = std::min(whole_x1, visible_x1);
+    int const y1 = std::min(whole_y1, visible_y1);
+    if (x0 >= x1 || y0 >= y1)
+        return false;
+
+    auto const *palette = rect.palette;
     bool visible = false;
-    for (int y = y0; y < y1; ++y) {
-        auto *dst_row = target.plane0 + static_cast<ptrdiff_t>(y) * target.stride0;
-        auto const *src_row = rect.pixels.data() + static_cast<size_t>(y - rect.y) * rect.width;
-        for (int x = x0; x < x1; ++x) {
-            auto const src = src_row[x - rect.x];
-            visible = visible || src.a != 0;
-            BlendPixel(src, dst_row + static_cast<ptrdiff_t>(x) * 4);
+
+    if (identity) {
+        for (int y = y0; y < y1; ++y) {
+            auto *dst_row = target.plane0 + static_cast<ptrdiff_t>(y) * target.stride0;
+            auto const *src_row = rect.indices.data() + static_cast<size_t>(y - rect.y) * rect.width;
+            for (int x = x0; x < x1; ++x) {
+                auto const& src = palette[src_row[x - rect.x]];
+                if (!visible && src.a != 0)
+                    visible = true;
+                if (copy_to_clear_target)
+                    StorePixel(src, dst_row + static_cast<ptrdiff_t>(x) * 4);
+                else
+                    BlendPixel(src, dst_row + static_cast<ptrdiff_t>(x) * 4);
+            }
+        }
+    } else {
+        // Nearest-neighbour sampling uses the global canvas grid so all rects
+        // agree on which authored pixel corresponds to a target pixel.
+        for (int y = y0; y < y1; ++y) {
+            auto *dst_row = target.plane0 + static_cast<ptrdiff_t>(y) * target.stride0;
+            int const authored_y = static_cast<int>(
+                static_cast<int64_t>(y) * authored_height / target.height);
+            int const src_y = authored_y - rect.y;
+            if (src_y < 0 || src_y >= rect.height)
+                continue;
+            auto const *src_row = rect.indices.data() + static_cast<size_t>(src_y) * rect.width;
+            for (int x = x0; x < x1; ++x) {
+                int const authored_x = static_cast<int>(
+                    static_cast<int64_t>(x) * authored_width / target.width);
+                int const src_x = authored_x - rect.x;
+                if (src_x < 0 || src_x >= rect.width)
+                    continue;
+                auto const& src = palette[src_row[src_x]];
+                if (!visible && src.a != 0)
+                    visible = true;
+                if (copy_to_clear_target)
+                    StorePixel(src, dst_row + static_cast<ptrdiff_t>(x) * 4);
+                else
+                    BlendPixel(src, dst_row + static_cast<ptrdiff_t>(x) * 4);
+            }
         }
     }
 
-    if (visible) {
-        target.has_visible_content = 1;
-        AddDirtyRect(target, x0, y0, x1 - x0, y1 - y0);
-    }
+    return visible;
 }
 
-class FfmpegSubtitleProviderImpl final : public FfmpegSubtitleProvider {
+class FfmpegBitmapSubtitleDecoderImpl final : public FfmpegBitmapSubtitleDecoder {
     std::string last_error;
     std::vector<SubtitleEvent> events;
+    std::vector<int64_t> prefix_max_event_end;
+    std::vector<int64_t> change_times;
+    CodecContextPtr codec;
+    std::vector<uint8_t> codec_private;
+    int fallback_canvas_width = 0;
+    int fallback_canvas_height = 0;
+    bool stream_finished = false;
 
-    int SetError(RagbagSubtitleStatusV0 status, std::string message) {
+    int SetError(RagbagSubtitleStatusV1 status, std::string message) {
         last_error = std::move(message);
         return static_cast<int>(status);
     }
 
-    int DecodeSubtitlePacket(AVCodecContext *codec_ctx, AVStream const *stream, AVPacket *packet) {
+    int OpenCodecContext(RagbagSubtitleStatusV1 failure_status, char const *action) {
+        AVCodec const *decoder = avcodec_find_decoder(AV_CODEC_ID_HDMV_PGS_SUBTITLE);
+        if (!decoder)
+            return SetError(failure_status, std::string(action) + ": FFmpeg PGS subtitle decoder is unavailable.");
+
+        CodecContextPtr next_codec(avcodec_alloc_context3(decoder));
+        if (!next_codec)
+            return SetError(failure_status, std::string(action) + ": failed to allocate FFmpeg codec context.");
+
+        next_codec->pkt_timebase = AV_TIME_BASE_Q;
+        if (!codec_private.empty()) {
+            auto const allocation_size = codec_private.size() + AV_INPUT_BUFFER_PADDING_SIZE;
+            next_codec->extradata = static_cast<uint8_t *>(av_mallocz(allocation_size));
+            if (!next_codec->extradata)
+                return SetError(failure_status, std::string(action) + ": failed to allocate subtitle codec private data.");
+            std::memcpy(next_codec->extradata, codec_private.data(), codec_private.size());
+            next_codec->extradata_size = static_cast<int>(codec_private.size());
+        }
+
+        int const result = avcodec_open2(next_codec.get(), decoder, nullptr);
+        if (result < 0)
+            return SetError(failure_status, std::string(action) + ": " + AvError(result));
+
+        codec = std::move(next_codec);
+        return RAGBAG_SUBTITLE_STATUS_OK;
+    }
+
+    void TruncateTimelineAt(int64_t time_ns) {
+        for (auto& event : events) {
+            if (event.start_ns <= time_ns && event.end_ns > time_ns)
+                event.end_ns = time_ns;
+        }
+    }
+
+    int DecodeSubtitlePacket(AVPacket *packet) {
         AVSubtitle subtitle = {};
         int got_subtitle = 0;
-        int result = avcodec_decode_subtitle2(codec_ctx, &subtitle, &got_subtitle, packet);
+        int result = avcodec_decode_subtitle2(codec.get(), &subtitle, &got_subtitle, packet);
         if (result < 0)
             return SetError(RAGBAG_SUBTITLE_STATUS_DECODE_FAILED, "FFmpeg subtitle decode failed: " + AvError(result));
         if (!got_subtitle)
             return RAGBAG_SUBTITLE_STATUS_OK;
 
-        double base = TimestampToSeconds(packet->pts, stream->time_base);
-        if (!IsFiniteTime(base))
-            base = TimestampToSeconds(packet->dts, stream->time_base);
-        if (subtitle.pts != AV_NOPTS_VALUE)
-            base = static_cast<double>(subtitle.pts) / AV_TIME_BASE;
-        if (!IsFiniteTime(base))
-            base = 0.0;
+        int64_t base_ns = AvTimeToNs(subtitle.pts);
+        if (base_ns == RAGBAG_SUBTITLE_TIMESTAMP_UNKNOWN)
+            base_ns = AvTimeToNs(packet->pts);
+        if (base_ns == RAGBAG_SUBTITLE_TIMESTAMP_UNKNOWN)
+            base_ns = AvTimeToNs(packet->dts);
+        if (base_ns == RAGBAG_SUBTITLE_TIMESTAMP_UNKNOWN)
+            base_ns = 0;
 
         SubtitleEvent event;
-        event.start = base + static_cast<double>(subtitle.start_display_time) / 1000.0;
-        if (subtitle.end_display_time > subtitle.start_display_time && subtitle.end_display_time != UINT32_MAX)
-            event.end = base + static_cast<double>(subtitle.end_display_time) / 1000.0;
-        else
-            event.end = event.start + 5.0;
+        event.start_ns = SaturatingAdd(base_ns, static_cast<int64_t>(subtitle.start_display_time) * 1000000);
+        if (subtitle.end_display_time > subtitle.start_display_time && subtitle.end_display_time != UINT32_MAX) {
+            event.end_ns = SaturatingAdd(base_ns, static_cast<int64_t>(subtitle.end_display_time) * 1000000);
+        }
+        else if (packet->duration > 0) {
+            event.end_ns = SaturatingAdd(event.start_ns, AvTimeToNs(packet->duration));
+        }
+
+        // The PGS presentation composition segment is authoritative for the
+        // authored canvas. FFmpeg publishes it on AVCodecContext while decoding.
+        event.authored_width = codec->width > 0 ? codec->width : fallback_canvas_width;
+        event.authored_height = codec->height > 0 ? codec->height : fallback_canvas_height;
 
         for (unsigned i = 0; i < subtitle.num_rects; ++i) {
             BitmapRect rect;
@@ -224,14 +403,14 @@ class FfmpegSubtitleProviderImpl final : public FfmpegSubtitleProvider {
 
         avsubtitle_free(&subtitle);
 
-        if (event.rects.empty()) {
-            if (!events.empty() && events.back().end > event.start)
-                events.back().end = event.start;
-            return RAGBAG_SUBTITLE_STATUS_OK;
-        }
+        // A PGS display set replaces the previous composition, including an
+        // empty display set used to clear it. Do not invent a five-second tail.
+        if (!events.empty() && events.back().end_ns > event.start_ns)
+            events.back().end_ns = event.start_ns;
 
-        if (!events.empty() && events.back().end > event.start)
-            events.back().end = event.start;
+        if (event.rects.empty())
+            return RAGBAG_SUBTITLE_STATUS_OK;
+
         events.push_back(std::move(event));
         return RAGBAG_SUBTITLE_STATUS_OK;
     }
@@ -241,94 +420,168 @@ public:
         return last_error.c_str();
     }
 
-    int OpenFile(char const *path_utf8, RagbagSubtitleVideoInfoV0 const *) override {
+    int BeginStream(RagbagSubtitleStreamInfoV1 const *stream) override {
         events.clear();
+        prefix_max_event_end.clear();
+        change_times.clear();
+        codec.reset();
+        codec_private.clear();
         last_error.clear();
-        if (!path_utf8 || !*path_utf8)
-            return SetError(RAGBAG_SUBTITLE_STATUS_INVALID_ARGUMENT, "Missing subtitle path.");
+        fallback_canvas_width = 0;
+        fallback_canvas_height = 0;
+        stream_finished = false;
 
-        AVFormatContext *raw_format = nullptr;
-        int result = avformat_open_input(&raw_format, path_utf8, nullptr, nullptr);
-        if (result < 0)
-            return SetError(RAGBAG_SUBTITLE_STATUS_OPEN_FAILED, "FFmpeg failed to open input: " + AvError(result));
-        FormatContextPtr format(raw_format);
-
-        result = avformat_find_stream_info(format.get(), nullptr);
-        if (result < 0)
-            return SetError(RAGBAG_SUBTITLE_STATUS_OPEN_FAILED, "FFmpeg failed to read stream info: " + AvError(result));
-
-        int subtitle_stream_index = av_find_best_stream(format.get(), AVMEDIA_TYPE_SUBTITLE, -1, -1, nullptr, 0);
-        if (subtitle_stream_index < 0)
-            return SetError(RAGBAG_SUBTITLE_STATUS_OPEN_FAILED, "No subtitle stream found in input.");
-
-        AVStream *stream = format->streams[subtitle_stream_index];
-        AVCodecParameters *codec_parameters = stream->codecpar;
-        AVCodec const *decoder = avcodec_find_decoder(codec_parameters->codec_id);
-        if (!decoder)
-            return SetError(RAGBAG_SUBTITLE_STATUS_OPEN_FAILED, "No FFmpeg subtitle decoder is available for this stream.");
-
-        CodecContextPtr codec(avcodec_alloc_context3(decoder));
-        if (!codec)
-            return SetError(RAGBAG_SUBTITLE_STATUS_OPEN_FAILED, "Failed to allocate FFmpeg codec context.");
-
-        result = avcodec_parameters_to_context(codec.get(), codec_parameters);
-        if (result < 0)
-            return SetError(RAGBAG_SUBTITLE_STATUS_OPEN_FAILED, "Failed to copy codec parameters: " + AvError(result));
-        codec->pkt_timebase = stream->time_base;
-
-        result = avcodec_open2(codec.get(), decoder, nullptr);
-        if (result < 0)
-            return SetError(RAGBAG_SUBTITLE_STATUS_OPEN_FAILED, "Failed to open subtitle decoder: " + AvError(result));
-
-        PacketPtr packet(av_packet_alloc());
-        if (!packet)
-            return SetError(RAGBAG_SUBTITLE_STATUS_OPEN_FAILED, "Failed to allocate FFmpeg packet.");
-
-        while ((result = av_read_frame(format.get(), packet.get())) >= 0) {
-            if (packet->stream_index == subtitle_stream_index) {
-                int decode_status = DecodeSubtitlePacket(codec.get(), stream, packet.get());
-                if (decode_status != RAGBAG_SUBTITLE_STATUS_OK) {
-                    av_packet_unref(packet.get());
-                    return decode_status;
-                }
-            }
-            av_packet_unref(packet.get());
+        if (!stream || stream->struct_size < sizeof(RagbagSubtitleStreamInfoV1)
+            || !stream->codec_id || std::strcmp(stream->codec_id, "hdmv-pgs") != 0) {
+            return SetError(RAGBAG_SUBTITLE_STATUS_INVALID_ARGUMENT, "Unsupported or invalid bitmap subtitle stream.");
+        }
+        if ((!stream->codec_private && stream->codec_private_size > 0)
+            || stream->codec_private_size > static_cast<uint64_t>(std::numeric_limits<int>::max() - AV_INPUT_BUFFER_PADDING_SIZE)) {
+            return SetError(RAGBAG_SUBTITLE_STATUS_INVALID_ARGUMENT, "Invalid subtitle codec private data.");
         }
 
-        std::sort(events.begin(), events.end(), [](SubtitleEvent const& a, SubtitleEvent const& b) {
-            return a.start < b.start;
+        fallback_canvas_width = std::max(stream->fallback_canvas_width, 0);
+        fallback_canvas_height = std::max(stream->fallback_canvas_height, 0);
+
+        if (stream->codec_private_size > 0) {
+            codec_private.assign(
+                stream->codec_private,
+                stream->codec_private + static_cast<size_t>(stream->codec_private_size));
+        }
+
+        return OpenCodecContext(RAGBAG_SUBTITLE_STATUS_OPEN_FAILED, "Failed to open subtitle decoder");
+    }
+
+    int PushPacket(RagbagSubtitlePacketV1 const *packet) override {
+        if (!codec || stream_finished)
+            return SetError(RAGBAG_SUBTITLE_STATUS_INVALID_ARGUMENT, "Bitmap subtitle stream is not accepting packets.");
+        if (!packet || packet->struct_size < sizeof(RagbagSubtitlePacketV1)
+            || (!packet->payload && packet->payload_size > 0)
+            || packet->payload_size > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+            return SetError(RAGBAG_SUBTITLE_STATUS_INVALID_ARGUMENT, "Invalid bitmap subtitle packet.");
+        }
+
+        if (packet->flags & RAGBAG_SUBTITLE_PACKET_FLAG_DISCONTINUITY) {
+            int64_t const discontinuity_ns = packet->pts_ns != RAGBAG_SUBTITLE_TIMESTAMP_UNKNOWN
+                ? packet->pts_ns
+                : packet->dts_ns;
+            if (discontinuity_ns == RAGBAG_SUBTITLE_TIMESTAMP_UNKNOWN) {
+                return SetError(
+                    RAGBAG_SUBTITLE_STATUS_INVALID_ARGUMENT,
+                    "A bitmap subtitle discontinuity requires a known PTS or DTS.");
+            }
+            auto const reset_status = OpenCodecContext(
+                RAGBAG_SUBTITLE_STATUS_DECODE_FAILED,
+                "Failed to reset subtitle decoder after discontinuity");
+            if (reset_status != RAGBAG_SUBTITLE_STATUS_OK)
+                return reset_status;
+            TruncateTimelineAt(discontinuity_ns);
+        }
+
+        PacketPtr av_packet(av_packet_alloc());
+        if (!av_packet)
+            return SetError(RAGBAG_SUBTITLE_STATUS_OPEN_FAILED, "Failed to allocate FFmpeg packet.");
+
+        int result = av_new_packet(av_packet.get(), static_cast<int>(packet->payload_size));
+        if (result < 0)
+            return SetError(RAGBAG_SUBTITLE_STATUS_OPEN_FAILED, "Failed to allocate FFmpeg packet payload: " + AvError(result));
+        if (packet->payload_size > 0)
+            std::memcpy(av_packet->data, packet->payload, static_cast<size_t>(packet->payload_size));
+        av_packet->pts = NsToAvTime(packet->pts_ns);
+        av_packet->dts = NsToAvTime(packet->dts_ns);
+        av_packet->duration = packet->duration_ns > 0 ? NsToAvTime(packet->duration_ns) : 0;
+
+        return DecodeSubtitlePacket(av_packet.get());
+    }
+
+    int EndStream() override {
+        if (!codec || stream_finished)
+            return SetError(RAGBAG_SUBTITLE_STATUS_INVALID_ARGUMENT, "Bitmap subtitle stream is not open.");
+
+        stream_finished = true;
+        std::stable_sort(events.begin(), events.end(), [](SubtitleEvent const& a, SubtitleEvent const& b) {
+            if (a.start_ns != b.start_ns)
+                return a.start_ns < b.start_ns;
+            return a.end_ns < b.end_ns;
         });
 
-        if (events.empty())
-            return SetError(RAGBAG_SUBTITLE_STATUS_DECODE_FAILED, "No bitmap subtitle events were decoded.");
+        prefix_max_event_end.reserve(events.size());
+        int64_t max_end = std::numeric_limits<int64_t>::min();
+        for (auto const& event : events) {
+            max_end = std::max(max_end, event.end_ns);
+            prefix_max_event_end.push_back(max_end);
+            change_times.push_back(event.start_ns);
+            if (event.end_ns != std::numeric_limits<int64_t>::max())
+                change_times.push_back(event.end_ns);
+        }
+
+        std::sort(change_times.begin(), change_times.end());
+        change_times.erase(std::unique(change_times.begin(), change_times.end()), change_times.end());
 
         return RAGBAG_SUBTITLE_STATUS_OK;
     }
 
-    int RenderOverlay(RagbagSubtitleRenderRequestV0 const *request, RagbagSubtitleOverlayTargetV0 *target) override {
-        if (!request || !target || target->struct_size < sizeof(RagbagSubtitleOverlayTargetV0))
+    int RenderAt(int64_t time_ns, RagbagSubtitleRenderTargetV1 *target, RagbagSubtitleRenderResultV1 *render_result) override {
+        if (!stream_finished || !target || !render_result
+            || target->struct_size < sizeof(RagbagSubtitleRenderTargetV1)
+            || render_result->struct_size < sizeof(RagbagSubtitleRenderResultV1)) {
             return SetError(RAGBAG_SUBTITLE_STATUS_INVALID_ARGUMENT, "Invalid render request or overlay target.");
-        if (target->pixel_format != RAGBAG_SUBTITLE_PIXEL_FORMAT_BGRA8 || target->alpha_mode != RAGBAG_SUBTITLE_ALPHA_PREMULTIPLIED)
-            return SetError(RAGBAG_SUBTITLE_STATUS_RENDER_FAILED, "Only premultiplied BGRA8 overlay targets are supported.");
+        }
         if (!target->plane0 || target->width <= 0 || target->height <= 0 || target->stride0 == 0)
             return SetError(RAGBAG_SUBTITLE_STATUS_RENDER_FAILED, "Overlay target has invalid storage.");
 
-        target->dirty_rect_count = 0;
-        target->has_visible_content = 0;
-        if (request->flags & RAGBAG_SUBTITLE_RENDER_CLEAR_TARGET) {
-            ClearTarget(*target);
-            AddDirtyRect(*target, 0, 0, target->width, target->height);
+        int64_t const row_bytes = static_cast<int64_t>(target->width) * 4;
+        int64_t const stride_bytes = target->stride0 < 0
+            ? -static_cast<int64_t>(target->stride0)
+            : static_cast<int64_t>(target->stride0);
+        if (row_bytes > stride_bytes
+            || (target->height > 1
+                && stride_bytes > static_cast<int64_t>(std::numeric_limits<ptrdiff_t>::max()) / (target->height - 1))) {
+            return SetError(RAGBAG_SUBTITLE_STATUS_RENDER_FAILED, "Overlay target stride is smaller than its rows or exceeds addressable storage.");
         }
 
-        double const time = request->time_seconds;
-        for (auto const& event : events) {
-            if (time < event.start)
-                break;
-            if (time >= event.end)
+        ClearTarget(*target);
+        render_result->has_visible_content = 0;
+        render_result->authored_width = 0;
+        render_result->authored_height = 0;
+
+        // Events are sorted by start. Locate the first event that starts strictly
+        // after the requested time via binary search. A prefix max-end index
+        // then finds the first event that could still be active even if subtitle
+        // events overlap. Active events are blended in authored (forward) order
+        // so later-starting events compose on top, matching the original scan.
+        auto upper = std::upper_bound(events.begin(), events.end(), time_ns,
+            [](int64_t t, SubtitleEvent const& e) { return t < e.start_ns; });
+        auto const upper_index = static_cast<size_t>(upper - events.begin());
+        auto const first_index = static_cast<size_t>(
+            std::upper_bound(prefix_max_event_end.begin(), prefix_max_event_end.begin() + upper_index, time_ns)
+                - prefix_max_event_end.begin());
+        auto first_active = events.begin() + static_cast<ptrdiff_t>(first_index);
+        bool copy_to_clear_target = true;
+        for (auto it = first_active; it != upper; ++it) {
+            if (time_ns >= it->end_ns)
                 continue;
-            for (auto const& rect : event.rects)
-                BlendRect(rect, *target);
+
+            int authored_width = it->authored_width > 0 ? it->authored_width : target->width;
+            int authored_height = it->authored_height > 0 ? it->authored_height : target->height;
+            render_result->authored_width = authored_width;
+            render_result->authored_height = authored_height;
+            for (auto const& rect : it->rects) {
+                if (BlendRect(rect, *target, authored_width, authored_height, copy_to_clear_target)) {
+                    copy_to_clear_target = false;
+                    render_result->has_visible_content = 1;
+                }
+            }
         }
+
+        auto next_change = std::upper_bound(change_times.begin(), change_times.end(), time_ns);
+        render_result->valid_until_ns = next_change == change_times.end()
+            ? std::numeric_limits<int64_t>::max()
+            : *next_change;
+        render_result->valid_from_ns = next_change == change_times.begin()
+            ? std::numeric_limits<int64_t>::min()
+            : *std::prev(next_change);
+        render_result->content_revision = static_cast<uint64_t>(next_change - change_times.begin());
 
         return RAGBAG_SUBTITLE_STATUS_OK;
     }
@@ -336,8 +589,8 @@ public:
 
 } // namespace
 
-std::unique_ptr<FfmpegSubtitleProvider> CreateFfmpegSubtitleProvider() {
-    return std::make_unique<FfmpegSubtitleProviderImpl>();
+std::unique_ptr<FfmpegBitmapSubtitleDecoder> CreateFfmpegBitmapSubtitleDecoder() {
+    return std::make_unique<FfmpegBitmapSubtitleDecoderImpl>();
 }
 
 } // namespace ragbag

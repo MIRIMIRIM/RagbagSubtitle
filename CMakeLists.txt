@@ -1,48 +1,77 @@
 cmake_minimum_required(VERSION 3.25)
 
 project(RagbagSubtitle
-    VERSION 0.1.0
-    DESCRIPTION "Dynamic subtitle plugin experiments for Aegisub"
+    VERSION 0.2.0
+    DESCRIPTION "Packet-backed bitmap subtitle decoder for Aegisub"
     LANGUAGES C CXX)
 
-option(RAGBAG_BUILD_FFMPEG_PROVIDER "Build the FFmpeg/libavformat subtitle provider plugin" ON)
+option(RAGBAG_BUILD_FFMPEG_DECODER "Build the FFmpeg/libavcodec subtitle decoder plugin" ON)
 option(RAGBAG_BUILD_PROBE "Build a tiny plugin loader probe executable" ON)
+set(RAGBAG_FFMPEG_ROOT "" CACHE PATH "Optional preinstalled FFmpeg package root")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-if(MSVC AND VCPKG_TARGET_TRIPLET MATCHES "static")
+if(MSVC AND VCPKG_TARGET_TRIPLET MATCHES "-static$")
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
 include(GNUInstallDirs)
+include(CTest)
 
 add_library(ragbag_subtitle_plugin_api INTERFACE)
 target_include_directories(ragbag_subtitle_plugin_api INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
-if(RAGBAG_BUILD_FFMPEG_PROVIDER)
+if(RAGBAG_BUILD_FFMPEG_DECODER)
     set(RAGBAG_FFMPEG_LINK_TARGET "")
 
-    if(WIN32 AND VCPKG_TARGET_TRIPLET MATCHES "static" AND DEFINED VCPKG_INSTALLED_DIR)
+    if(RAGBAG_FFMPEG_ROOT)
+        set(RAGBAG_VCPKG_TARGET_DIR "${RAGBAG_FFMPEG_ROOT}")
+    elseif(WIN32 AND VCPKG_TARGET_TRIPLET MATCHES "static" AND DEFINED VCPKG_INSTALLED_DIR)
         set(RAGBAG_VCPKG_TARGET_DIR "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}")
-        if(EXISTS "${RAGBAG_VCPKG_TARGET_DIR}/include/libavcodec/avcodec.h")
-            add_library(ragbag_ffmpeg_static INTERFACE)
-            target_include_directories(ragbag_ffmpeg_static INTERFACE
-                "${RAGBAG_VCPKG_TARGET_DIR}/include")
-            target_link_directories(ragbag_ffmpeg_static INTERFACE
-                "${RAGBAG_VCPKG_TARGET_DIR}/lib")
-            foreach(RAGBAG_FFMPEG_LIB avformat avcodec avutil)
-                target_link_libraries(ragbag_ffmpeg_static INTERFACE
-                    optimized "${RAGBAG_VCPKG_TARGET_DIR}/lib/${RAGBAG_FFMPEG_LIB}.lib")
-                if(EXISTS "${RAGBAG_VCPKG_TARGET_DIR}/debug/lib/${RAGBAG_FFMPEG_LIB}.lib")
-                    target_link_libraries(ragbag_ffmpeg_static INTERFACE
-                        debug "${RAGBAG_VCPKG_TARGET_DIR}/debug/lib/${RAGBAG_FFMPEG_LIB}.lib")
-                endif()
-            endforeach()
-            target_link_libraries(ragbag_ffmpeg_static INTERFACE
+    endif()
+    if(RAGBAG_VCPKG_TARGET_DIR)
+        if(NOT EXISTS "${RAGBAG_VCPKG_TARGET_DIR}/include/libavcodec/avcodec.h")
+            message(FATAL_ERROR "FFmpeg headers were not found below ${RAGBAG_VCPKG_TARGET_DIR}.")
+        endif()
+
+        add_library(ragbag_ffmpeg_explicit INTERFACE)
+        target_include_directories(ragbag_ffmpeg_explicit INTERFACE
+            "${RAGBAG_VCPKG_TARGET_DIR}/include")
+        foreach(RAGBAG_FFMPEG_LIB avcodec avutil swresample)
+            string(TOUPPER "${RAGBAG_FFMPEG_LIB}" RAGBAG_FFMPEG_LIB_UPPER)
+            unset(RAGBAG_${RAGBAG_FFMPEG_LIB_UPPER}_LIBRARY_RELEASE CACHE)
+            unset(RAGBAG_${RAGBAG_FFMPEG_LIB_UPPER}_LIBRARY_DEBUG CACHE)
+            find_library(RAGBAG_${RAGBAG_FFMPEG_LIB_UPPER}_LIBRARY_RELEASE
+                NAMES "${RAGBAG_FFMPEG_LIB}"
+                PATHS
+                    "${RAGBAG_VCPKG_TARGET_DIR}/lib"
+                    "${RAGBAG_VCPKG_TARGET_DIR}/lib64"
+                NO_DEFAULT_PATH)
+            find_library(RAGBAG_${RAGBAG_FFMPEG_LIB_UPPER}_LIBRARY_DEBUG
+                NAMES "${RAGBAG_FFMPEG_LIB}"
+                PATHS
+                    "${RAGBAG_VCPKG_TARGET_DIR}/debug/lib"
+                    "${RAGBAG_VCPKG_TARGET_DIR}/debug/lib64"
+                NO_DEFAULT_PATH)
+            if(NOT RAGBAG_${RAGBAG_FFMPEG_LIB_UPPER}_LIBRARY_RELEASE)
+                message(FATAL_ERROR "FFmpeg library ${RAGBAG_FFMPEG_LIB} was not found below ${RAGBAG_VCPKG_TARGET_DIR}.")
+            endif()
+            target_link_libraries(ragbag_ffmpeg_explicit INTERFACE
+                optimized "${RAGBAG_${RAGBAG_FFMPEG_LIB_UPPER}_LIBRARY_RELEASE}")
+            if(RAGBAG_${RAGBAG_FFMPEG_LIB_UPPER}_LIBRARY_DEBUG)
+                target_link_libraries(ragbag_ffmpeg_explicit INTERFACE
+                    debug "${RAGBAG_${RAGBAG_FFMPEG_LIB_UPPER}_LIBRARY_DEBUG}")
+            else()
+                target_link_libraries(ragbag_ffmpeg_explicit INTERFACE
+                    debug "${RAGBAG_${RAGBAG_FFMPEG_LIB_UPPER}_LIBRARY_RELEASE}")
+            endif()
+        endforeach()
+        if(WIN32)
+            target_link_libraries(ragbag_ffmpeg_explicit INTERFACE
                 secur32
                 ncrypt
                 crypt32
@@ -52,8 +81,8 @@ if(RAGBAG_BUILD_FFMPEG_PROVIDER)
                 ole32
                 user32
                 bcrypt)
-            set(RAGBAG_FFMPEG_LINK_TARGET ragbag_ffmpeg_static)
         endif()
+        set(RAGBAG_FFMPEG_LINK_TARGET ragbag_ffmpeg_explicit)
     endif()
 
     if(NOT RAGBAG_FFMPEG_LINK_TARGET)
@@ -65,7 +94,6 @@ if(RAGBAG_BUILD_FFMPEG_PROVIDER)
             list(APPEND PKG_CONFIG_ARGN --static)
         endif()
         pkg_check_modules(RAGBAG_FFMPEG QUIET IMPORTED_TARGET
-            libavformat
             libavcodec
             libavutil)
         set(PKG_CONFIG_ARGN "${RAGBAG_OLD_PKG_CONFIG_ARGN}")
@@ -75,11 +103,7 @@ if(RAGBAG_BUILD_FFMPEG_PROVIDER)
     endif()
 
     if(NOT RAGBAG_FFMPEG_LINK_TARGET)
-        find_package(FFMPEG QUIET)
-    endif()
-
-    if(NOT RAGBAG_FFMPEG_LINK_TARGET AND NOT FFMPEG_FOUND)
-        message(FATAL_ERROR "FFmpeg development libraries were not found. With vcpkg, configure using -DCMAKE_TOOLCHAIN_FILE=F:/vcpkg/scripts/buildsystems/vcpkg.cmake so the ffmpeg[avcodec,avformat] manifest dependency is installed.")
+        message(FATAL_ERROR "FFmpeg libavcodec/libavutil development libraries were not found. Use pkg-config, set RAGBAG_FFMPEG_ROOT to a preinstalled FFmpeg package root, or configure with the vcpkg toolchain so the ffmpeg[avcodec] manifest dependency is installed. Broad FindFFMPEG fallbacks are intentionally unsupported because they may add libavformat.")
     endif()
 
     add_library(ragbag_subtitle_ffmpeg SHARED
@@ -90,18 +114,34 @@ if(RAGBAG_BUILD_FFMPEG_PROVIDER)
     target_link_libraries(ragbag_subtitle_ffmpeg PRIVATE ragbag_subtitle_plugin_api)
     target_compile_definitions(ragbag_subtitle_ffmpeg PRIVATE RAGBAG_SUBTITLE_PLUGIN_BUILD)
 
-    if(RAGBAG_FFMPEG_LINK_TARGET)
-        target_link_libraries(ragbag_subtitle_ffmpeg PRIVATE ${RAGBAG_FFMPEG_LINK_TARGET})
-    else()
-        target_include_directories(ragbag_subtitle_ffmpeg PRIVATE ${FFMPEG_INCLUDE_DIRS})
-        target_link_directories(ragbag_subtitle_ffmpeg PRIVATE ${FFMPEG_LIBRARY_DIRS})
-        target_link_libraries(ragbag_subtitle_ffmpeg PRIVATE ${FFMPEG_LIBRARIES})
-    endif()
+    target_link_libraries(ragbag_subtitle_ffmpeg PRIVATE ${RAGBAG_FFMPEG_LINK_TARGET})
 
     if(MSVC)
-        target_compile_options(ragbag_subtitle_ffmpeg PRIVATE /W4 /permissive- /utf-8)
+        target_compile_options(ragbag_subtitle_ffmpeg PRIVATE
+            /W4
+            /permissive-
+            /utf-8
+            $<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:/Gy>
+            $<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:/Gw>
+            $<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:/Zc:inline>)
+        target_link_options(ragbag_subtitle_ffmpeg PRIVATE
+            $<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:/INCREMENTAL:NO>
+            $<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:/OPT:REF>
+            $<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:/OPT:ICF>)
     else()
-        target_compile_options(ragbag_subtitle_ffmpeg PRIVATE -Wall -Wextra -Wpedantic)
+        target_compile_options(ragbag_subtitle_ffmpeg PRIVATE
+            -Wall
+            -Wextra
+            -Wpedantic
+            $<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:-ffunction-sections>
+            $<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:-fdata-sections>)
+        if(APPLE)
+            target_link_options(ragbag_subtitle_ffmpeg PRIVATE
+                $<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:-Wl,-dead_strip>)
+        else()
+            target_link_options(ragbag_subtitle_ffmpeg PRIVATE
+                $<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:-Wl,--gc-sections>)
+        endif()
     endif()
 
     set_target_properties(ragbag_subtitle_ffmpeg PROPERTIES
@@ -127,6 +167,11 @@ if(RAGBAG_BUILD_PROBE)
         target_compile_options(ragbag_subtitle_probe PRIVATE /W4 /permissive- /utf-8)
     else()
         target_compile_options(ragbag_subtitle_probe PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    if(BUILD_TESTING AND RAGBAG_BUILD_FFMPEG_DECODER)
+        add_test(
+            NAME ragbag_subtitle_decoder_smoke
+            COMMAND ragbag_subtitle_probe $<TARGET_FILE:ragbag_subtitle_ffmpeg>)
     endif()
 endif()
 

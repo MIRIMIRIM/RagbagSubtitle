@@ -3,10 +3,10 @@
 
 #include "ragbag/subtitle_plugin_api.h"
 
+#include <algorithm>
 #include <cstdint>
-#include <cstdlib>
 #include <iostream>
-#include <string>
+#include <iterator>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -16,149 +16,265 @@
 
 namespace {
 
-using InitFunction = int32_t (*)(RagbagSubtitleHostApiV0 const *, RagbagSubtitlePluginApiV0 *);
+using InitFunction = int32_t (*)(RagbagSubtitleHostApiV1 const*, RagbagSubtitlePluginApiV1*);
 
-void HostLog(void *, RagbagSubtitleLogLevelV0 level, char const *message) {
-    std::cerr << "[plugin " << static_cast<int>(level) << "] " << (message ? message : "") << '\n';
+void Log(void*, RagbagSubtitleLogLevelV1 level, char const *message) {
+	std::cerr << "[plugin " << static_cast<int>(level) << "] " << (message ? message : "") << '\n';
 }
 
 #ifdef _WIN32
-std::wstring Utf8ToWide(std::string const& value) {
-    if (value.empty())
-        return {};
-    int const needed = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.c_str(), -1, nullptr, 0);
-    if (needed <= 0)
-        return {};
-    std::wstring wide(static_cast<size_t>(needed), L'\0');
-    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.c_str(), -1, wide.data(), needed))
-        return {};
-    wide.pop_back();
-    return wide;
+using LibraryHandle = HMODULE;
+
+LibraryHandle OpenLibrary(char const *path) {
+	return LoadLibraryA(path);
 }
 
-std::string LastLoadError() {
-    DWORD const err = GetLastError();
-    return "Windows error " + std::to_string(static_cast<unsigned long>(err));
+InitFunction ResolveInit(LibraryHandle library) {
+	return reinterpret_cast<InitFunction>(GetProcAddress(library, "ragbag_subtitle_decoder_init_v1"));
+}
+
+void CloseLibrary(LibraryHandle library) {
+	if (library)
+		FreeLibrary(library);
 }
 #else
-std::string LastLoadError() {
-    auto const *err = dlerror();
-    return err ? err : "unknown dlopen error";
+using LibraryHandle = void*;
+
+LibraryHandle OpenLibrary(char const *path) {
+	return dlopen(path, RTLD_NOW | RTLD_LOCAL);
+}
+
+InitFunction ResolveInit(LibraryHandle library) {
+	return reinterpret_cast<InitFunction>(dlsym(library, "ragbag_subtitle_decoder_init_v1"));
+}
+
+void CloseLibrary(LibraryHandle library) {
+	if (library)
+		dlclose(library);
 }
 #endif
-
-class DynamicLibrary {
-#ifdef _WIN32
-    HMODULE handle = nullptr;
-#else
-    void *handle = nullptr;
-#endif
-
-public:
-    explicit DynamicLibrary(std::string const& path) {
-#ifdef _WIN32
-        auto wide = Utf8ToWide(path);
-        handle = wide.empty() ? nullptr : LoadLibraryW(wide.c_str());
-#else
-        handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-#endif
-    }
-
-    ~DynamicLibrary() {
-#ifdef _WIN32
-        if (handle)
-            FreeLibrary(handle);
-#else
-        if (handle)
-            dlclose(handle);
-#endif
-    }
-
-    explicit operator bool() const { return handle != nullptr; }
-
-    InitFunction ResolveInit() const {
-        if (!handle)
-            return nullptr;
-#ifdef _WIN32
-        return reinterpret_cast<InitFunction>(GetProcAddress(handle, "ragbag_subtitle_plugin_init_v0"));
-#else
-        return reinterpret_cast<InitFunction>(dlsym(handle, "ragbag_subtitle_plugin_init_v0"));
-#endif
-    }
-};
-
-void PrintDescriptor(RagbagSubtitleProviderDescriptorV0 const& descriptor) {
-    std::cout << "provider.id=" << (descriptor.provider_id ? descriptor.provider_id : "") << '\n';
-    std::cout << "provider.name=" << (descriptor.display_name ? descriptor.display_name : "") << '\n';
-    std::cout << "provider.debug=" << (descriptor.debug_name ? descriptor.debug_name : "") << '\n';
-    std::cout << "provider.extensions=" << (descriptor.extensions_semicolon ? descriptor.extensions_semicolon : "") << '\n';
-    std::cout << "provider.codecs=" << (descriptor.codec_names_semicolon ? descriptor.codec_names_semicolon : "") << '\n';
-    std::cout << "provider.capabilities=" << descriptor.capabilities << '\n';
-}
 
 } // namespace
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        std::cerr << "usage: ragbag_subtitle_probe <plugin-path> [subtitle-file]\n";
-        return 2;
-    }
+	if (argc != 2) {
+		std::cerr << "usage: ragbag_subtitle_probe <plugin-path>\n";
+		return 2;
+	}
 
-    DynamicLibrary library(argv[1]);
-    if (!library) {
-        std::cerr << "failed to load plugin: " << LastLoadError() << '\n';
-        return 1;
-    }
+	auto library = OpenLibrary(argv[1]);
+	if (!library) {
+		std::cerr << "failed to load plugin\n";
+		return 1;
+	}
 
-    auto init = library.ResolveInit();
-    if (!init) {
-        std::cerr << "plugin does not export ragbag_subtitle_plugin_init_v0\n";
-        return 1;
-    }
+	auto init = ResolveInit(library);
+	if (!init) {
+		std::cerr << "plugin does not export ragbag_subtitle_decoder_init_v1\n";
+		CloseLibrary(library);
+		return 1;
+	}
 
-    RagbagSubtitleHostApiV0 host = {};
-    host.struct_size = sizeof(host);
-    host.api_version = RAGBAG_SUBTITLE_PLUGIN_API_VERSION;
-    host.log = HostLog;
+	RagbagSubtitleHostApiV1 host = {};
+	host.struct_size = sizeof(host);
+	host.api_version = RAGBAG_SUBTITLE_DECODER_API_VERSION;
+	host.log = Log;
 
-    RagbagSubtitlePluginApiV0 plugin = {};
-    plugin.struct_size = sizeof(plugin);
-    auto status = init(&host, &plugin);
-    if (status != RAGBAG_SUBTITLE_STATUS_OK) {
-        std::cerr << "plugin init failed: " << status << '\n';
-        return 1;
-    }
+	RagbagSubtitlePluginApiV1 plugin = {};
+	plugin.struct_size = sizeof(plugin);
+	auto status = init(&host, &plugin);
+	if (status != RAGBAG_SUBTITLE_STATUS_OK) {
+		std::cerr << "plugin init failed: " << status << '\n';
+		CloseLibrary(library);
+		return 1;
+	}
 
-    std::cout << "plugin.id=" << (plugin.plugin_id ? plugin.plugin_id : "") << '\n';
-    std::cout << "plugin.name=" << (plugin.plugin_name ? plugin.plugin_name : "") << '\n';
-    std::cout << "plugin.version=" << (plugin.plugin_version ? plugin.plugin_version : "") << '\n';
-    std::cout << "plugin.license=" << (plugin.plugin_license ? plugin.plugin_license : "") << '\n';
+	std::cout << "plugin.id=" << (plugin.plugin_id ? plugin.plugin_id : "") << '\n';
+	std::cout << "plugin.name=" << (plugin.plugin_name ? plugin.plugin_name : "") << '\n';
+	std::cout << "plugin.version=" << (plugin.plugin_version ? plugin.plugin_version : "") << '\n';
+	uint32_t const count = plugin.get_decoder_count ? plugin.get_decoder_count() : 0;
+	std::cout << "decoder.count=" << count << '\n';
+	for (uint32_t index = 0; index < count; ++index) {
+		auto const *descriptor = plugin.get_decoder_descriptor(index);
+		if (!descriptor)
+			continue;
+		std::cout << "decoder[" << index << "].id=" << (descriptor->decoder_id ? descriptor->decoder_id : "") << '\n';
+		std::cout << "decoder[" << index << "].codecs=" << (descriptor->codec_ids_semicolon ? descriptor->codec_ids_semicolon : "") << '\n';
+	}
 
-    uint32_t const count = plugin.get_provider_count ? plugin.get_provider_count() : 0;
-    std::cout << "provider.count=" << count << '\n';
-    for (uint32_t i = 0; i < count; ++i) {
-        auto const *descriptor = plugin.get_provider_descriptor ? plugin.get_provider_descriptor(i) : nullptr;
-        if (descriptor)
-            PrintDescriptor(*descriptor);
-    }
+	if (count > 0) {
+		auto const *descriptor = plugin.get_decoder_descriptor(0);
+		RagbagSubtitleDecoderV1 *decoder = nullptr;
+		status = plugin.create_decoder(descriptor->decoder_id, &decoder);
+		RagbagSubtitleStreamInfoV1 stream = {};
+		stream.struct_size = sizeof(stream);
+		stream.codec_id = "hdmv-pgs";
+		if (status == RAGBAG_SUBTITLE_STATUS_OK)
+			status = plugin.begin_stream(decoder, &stream);
 
-    if (argc >= 3 && count > 0 && plugin.create_provider && plugin.open_file && plugin.destroy_provider) {
-        auto const *descriptor = plugin.get_provider_descriptor(0);
-        RagbagSubtitleProviderV0 *provider = nullptr;
-        status = plugin.create_provider(descriptor->provider_id, &provider);
-        if (status == RAGBAG_SUBTITLE_STATUS_OK) {
-            RagbagSubtitleVideoInfoV0 video = {};
-            video.struct_size = sizeof(video);
-            status = plugin.open_file(provider, argv[2], &video);
-            std::cout << "open.status=" << status << '\n';
-            if (status != RAGBAG_SUBTITLE_STATUS_OK && plugin.get_last_error)
-                std::cout << "open.error=" << plugin.get_last_error(provider) << '\n';
-            plugin.destroy_provider(provider);
-        }
-        else {
-            std::cout << "create.status=" << status << '\n';
-        }
-    }
+		// A 3x2 canvas with a 2x2 single-color PGS object, followed by a
+		// zero-object presentation which clears it at two seconds.
+		static uint8_t const pcs[] = {
+			0x16, 0x00, 0x13,
+			0x00, 0x03, 0x00, 0x02, 0x10, 0x00, 0x00, 0x80,
+			0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+		};
+		static uint8_t const palette[] = {
+			0x14, 0x00, 0x07, 0x00, 0x00, 0x01, 0xeb, 0x80, 0x80, 0xff
+		};
+		static uint8_t const object[] = {
+			0x15, 0x00, 0x13,
+			0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x0c,
+			0x00, 0x02, 0x00, 0x02,
+			0x01, 0x01, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00
+		};
+		static uint8_t const display_end[] = { 0x80, 0x00, 0x00 };
+		static uint8_t const clear_pcs[] = {
+			0x16, 0x00, 0x0b,
+			0x00, 0x03, 0x00, 0x02, 0x10,
+			0x00, 0x01, 0x00, 0x00, 0x00, 0x00
+		};
+		auto push = [&](int64_t pts_ns, uint8_t const *data, size_t size,
+		                uint32_t flags = RAGBAG_SUBTITLE_PACKET_FLAG_NONE) {
+			if (status != RAGBAG_SUBTITLE_STATUS_OK)
+				return;
+			RagbagSubtitlePacketV1 packet = {};
+			packet.struct_size = sizeof(packet);
+			packet.pts_ns = pts_ns;
+			packet.dts_ns = RAGBAG_SUBTITLE_TIMESTAMP_UNKNOWN;
+			packet.flags = flags;
+			packet.payload = data;
+			packet.payload_size = size;
+			status = plugin.push_packet(decoder, &packet);
+		};
+		push(1000000000, pcs, sizeof(pcs));
+		push(1000000000, palette, sizeof(palette));
+		push(1000000000, object, sizeof(object));
+		push(1000000000, display_end, sizeof(display_end));
+		push(2000000000, clear_pcs, sizeof(clear_pcs));
+		push(2000000000, display_end, sizeof(display_end));
+		push(3000000000, pcs, sizeof(pcs));
+		push(3000000000, palette, sizeof(palette));
+		push(3000000000, object, sizeof(object));
+		push(3000000000, display_end, sizeof(display_end));
+		// A discontinuity must both end the decoded timeline at four seconds
+		// and reset FFmpeg's retained PGS presentation/object state.
+		push(4000000000, palette, sizeof(palette), RAGBAG_SUBTITLE_PACKET_FLAG_DISCONTINUITY);
+		if (status == RAGBAG_SUBTITLE_STATUS_OK)
+			status = plugin.end_stream(decoder);
 
-    return 0;
+		uint8_t invalid_pixels[24];
+		std::fill(std::begin(invalid_pixels), std::end(invalid_pixels), uint8_t{0x5a});
+		RagbagSubtitleRenderTargetV1 invalid_target = {};
+		invalid_target.struct_size = sizeof(invalid_target);
+		invalid_target.plane0 = invalid_pixels;
+		invalid_target.stride0 = 4;
+		invalid_target.width = 3;
+		invalid_target.height = 2;
+		RagbagSubtitleRenderResultV1 invalid_result = {};
+		invalid_result.struct_size = sizeof(invalid_result);
+		auto const invalid_status = status == RAGBAG_SUBTITLE_STATUS_OK
+			? plugin.render_at(decoder, 1500000000, &invalid_target, &invalid_result)
+			: status;
+		bool const invalid_target_untouched = std::all_of(
+			std::begin(invalid_pixels), std::end(invalid_pixels),
+			[](uint8_t value) { return value == 0x5a; });
+
+		uint8_t pixels[24];
+		std::fill(std::begin(pixels), std::end(pixels), uint8_t{0x7d});
+		RagbagSubtitleRenderTargetV1 target = {};
+		target.struct_size = sizeof(target);
+		target.plane0 = pixels;
+		target.stride0 = 12;
+		target.width = 3;
+		target.height = 2;
+		RagbagSubtitleRenderResultV1 result = {};
+		result.struct_size = sizeof(result);
+		if (status == RAGBAG_SUBTITLE_STATUS_OK)
+			status = plugin.render_at(decoder, 1500000000, &target, &result);
+
+		bool visible_pixels_are_opaque = true;
+		bool transparent_column_is_clear = true;
+		for (int y = 0; y < 2; ++y) {
+			for (int x = 0; x < 2; ++x) {
+				auto const *pixel = pixels + y * 12 + x * 4;
+				visible_pixels_are_opaque = visible_pixels_are_opaque
+					&& pixel[3] == 0xff
+					&& (pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0);
+			}
+			auto const *transparent = pixels + y * 12 + 8;
+			transparent_column_is_clear = transparent_column_is_clear
+				&& std::all_of(transparent, transparent + 4, [](uint8_t value) { return value == 0; });
+		}
+
+		uint8_t scaled_pixels[16];
+		std::fill(std::begin(scaled_pixels), std::end(scaled_pixels), uint8_t{0x7d});
+		RagbagSubtitleRenderTargetV1 scaled_target = {};
+		scaled_target.struct_size = sizeof(scaled_target);
+		scaled_target.plane0 = scaled_pixels;
+		scaled_target.stride0 = 8;
+		scaled_target.width = 2;
+		scaled_target.height = 2;
+		RagbagSubtitleRenderResultV1 scaled_result = {};
+		scaled_result.struct_size = sizeof(scaled_result);
+		if (status == RAGBAG_SUBTITLE_STATUS_OK)
+			status = plugin.render_at(decoder, 1500000000, &scaled_target, &scaled_result);
+		bool scaled_pixels_are_opaque = true;
+		for (size_t offset = 3; offset < std::size(scaled_pixels); offset += 4)
+			scaled_pixels_are_opaque = scaled_pixels_are_opaque && scaled_pixels[offset] == 0xff;
+
+		std::fill(std::begin(pixels), std::end(pixels), uint8_t{0x7d});
+		RagbagSubtitleRenderResultV1 clear_result = {};
+		clear_result.struct_size = sizeof(clear_result);
+		if (status == RAGBAG_SUBTITLE_STATUS_OK)
+			status = plugin.render_at(decoder, 2000000000, &target, &clear_result);
+		bool const cleared_pixels_are_zero = std::all_of(
+			std::begin(pixels), std::end(pixels),
+			[](uint8_t value) { return value == 0; });
+
+		std::fill(std::begin(pixels), std::end(pixels), uint8_t{0x7d});
+		RagbagSubtitleRenderResultV1 redisplayed_result = {};
+		redisplayed_result.struct_size = sizeof(redisplayed_result);
+		if (status == RAGBAG_SUBTITLE_STATUS_OK)
+			status = plugin.render_at(decoder, 3500000000, &target, &redisplayed_result);
+
+		std::fill(std::begin(pixels), std::end(pixels), uint8_t{0x7d});
+		RagbagSubtitleRenderResultV1 discontinuity_result = {};
+		discontinuity_result.struct_size = sizeof(discontinuity_result);
+		if (status == RAGBAG_SUBTITLE_STATUS_OK)
+			status = plugin.render_at(decoder, 4500000000, &target, &discontinuity_result);
+		bool const discontinuity_pixels_are_zero = std::all_of(
+			std::begin(pixels), std::end(pixels),
+			[](uint8_t value) { return value == 0; });
+
+		if (plugin.destroy_decoder)
+			plugin.destroy_decoder(decoder);
+		if (invalid_status != RAGBAG_SUBTITLE_STATUS_RENDER_FAILED || !invalid_target_untouched
+			|| status != RAGBAG_SUBTITLE_STATUS_OK
+			|| !visible_pixels_are_opaque || !transparent_column_is_clear
+			|| result.has_visible_content == 0 || result.authored_width != 3 || result.authored_height != 2
+			|| scaled_result.has_visible_content == 0 || !scaled_pixels_are_opaque
+			|| clear_result.has_visible_content != 0 || !cleared_pixels_are_zero
+			|| redisplayed_result.has_visible_content == 0
+			|| discontinuity_result.has_visible_content != 0 || !discontinuity_pixels_are_zero) {
+			std::cerr << "decoder lifecycle smoke test failed: status=" << status
+				<< " invalid_status=" << invalid_status
+				<< " invalid_untouched=" << invalid_target_untouched
+				<< " identity_visible=" << visible_pixels_are_opaque
+				<< " transparent_clear=" << transparent_column_is_clear
+				<< " scaled_visible=" << scaled_pixels_are_opaque
+				<< " clear_visible=" << clear_result.has_visible_content
+				<< " clear_zero=" << cleared_pixels_are_zero
+				<< " redisplayed_visible=" << redisplayed_result.has_visible_content
+				<< " discontinuity_visible=" << discontinuity_result.has_visible_content
+				<< " discontinuity_zero=" << discontinuity_pixels_are_zero
+				<< '\n';
+			CloseLibrary(library);
+			return 1;
+		}
+		std::cout << "decoder.smoke=ok\n";
+	}
+
+	CloseLibrary(library);
+	return count > 0 ? 0 : 1;
 }
