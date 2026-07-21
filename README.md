@@ -7,10 +7,11 @@ The C API is intentionally versioned as `v1`. It remains an internal contract sh
 ## Current shape
 
 - One dynamic library target: `ragbag-subtitle-ffmpeg`.
-- One decoder descriptor: `ragbag.pgs`.
-- Input: host-demuxed `hdmv-pgs` packet streams with nanosecond timestamps.
-- Decode: the libavcodec PGS decoder; libavformat is deliberately not linked
-  (libavutil and libswresample remain libavcodec dependencies).
+- One FFmpeg bitmap decoder descriptor advertising `hdmv-pgs` and `dvd-subtitle`.
+- Input: host-demuxed PGS segments or complete raw DVD/VobSub SPU packets with
+  nanosecond timestamps. External `.idx` / `.sub` file pairs remain host-owned.
+- Decode: the libavcodec PGS and DVD subtitle decoders; libavformat is deliberately not linked
+  (libavutil remains a libavcodec dependency).
 - Output: a fully overwritten host-owned BGRA8 premultiplied target.
 - Scope: Aegisub secondary subtitles only. This is not a document or primary-subtitle renderer API.
 
@@ -36,7 +37,7 @@ $cmake = 'C:/Program Files/Microsoft Visual Studio/18/Community/Common7/IDE/Comm
 
 For a preinstalled package without pkg-config, set `RAGBAG_FFMPEG_ROOT` to the
 package root containing `include/libavcodec` and `lib` (or `lib64`). CMake
-resolves the platform-native `avcodec`, `avutil`, and `swresample` library
+resolves the platform-native `avcodec` and `avutil` library
 files explicitly and fails during configuration if any are missing. A broad
 `find_package(FFMPEG)` fallback is intentionally not used because such modules
 may silently add libavformat and break the decoder-only boundary.
@@ -56,7 +57,8 @@ dumpbin /dependents build/windows-vcpkg/RelWithDebInfo/ragbag-subtitle-ffmpeg.dl
 
 When `BUILD_TESTING` is enabled, the decoder lifecycle probe is registered with
 CTest and covers invalid stride rejection, transparent clearing, non-integer
-canvas scaling, empty-display clearing, and discontinuity handling:
+canvas scaling, empty-display clearing, discontinuity handling, and a complete
+VobSub SPU with IDX-style canvas and palette metadata:
 
 ```powershell
 & $cmake --build --preset windows-vcpkg --config RelWithDebInfo
@@ -81,11 +83,11 @@ before shipping binaries.
 
 ## Decoder model
 
-The v1 ABI accepts a complete packet stream before random-access rendering begins. Packet payload memory is borrowed only for the duration of `push_packet`; the decoder retains its own timeline. Sessions are single-threaded, while independent sessions may run concurrently. File extensions and container codec IDs are intentionally absent from the decoder contract.
+The v1 ABI accepts a complete packet stream before random-access rendering begins. Packet payload memory is borrowed only for the duration of `push_packet`; the decoder retains its own timeline. Sessions are single-threaded, while independent sessions may run concurrently. File extensions and container codec IDs are intentionally absent from the decoder contract. A `dvd-subtitle` packet is one complete raw DVD SPU after the host has removed the `.sub` MPEG-PS/PES envelope; its codec-private data contains the VobSub `size:` and `palette:` header lines.
 
 ### Resolution and scaling
 
-PGS carries an authored composition resolution in its presentation composition segment. The FFmpeg decoder exposes that value through its codec context and Ragbag records it with each decoded event. The host-provided fallback is used only for malformed streams without a declared canvas. When the target differs from the authored canvas, Ragbag uses nearest-neighbour sampling so palette edges are not blurred.
+PGS carries an authored composition resolution in its presentation composition segment. VobSub supplies it through the IDX or Matroska CodecPrivate `size:` line. The FFmpeg decoder exposes that value through its codec context and Ragbag records it with each decoded event. The host-provided fallback is used only for streams without a declared canvas. When the target differs from the authored canvas, Ragbag uses nearest-neighbour sampling so palette edges are not blurred.
 
 ## HDR and color
 

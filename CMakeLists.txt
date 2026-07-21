@@ -41,7 +41,7 @@ if(RAGBAG_BUILD_FFMPEG_DECODER)
         add_library(ragbag_ffmpeg_explicit INTERFACE)
         target_include_directories(ragbag_ffmpeg_explicit INTERFACE
             "${RAGBAG_VCPKG_TARGET_DIR}/include")
-        foreach(RAGBAG_FFMPEG_LIB avcodec avutil swresample)
+        foreach(RAGBAG_FFMPEG_LIB avcodec avutil)
             string(TOUPPER "${RAGBAG_FFMPEG_LIB}" RAGBAG_FFMPEG_LIB_UPPER)
             unset(RAGBAG_${RAGBAG_FFMPEG_LIB_UPPER}_LIBRARY_RELEASE CACHE)
             unset(RAGBAG_${RAGBAG_FFMPEG_LIB_UPPER}_LIBRARY_DEBUG CACHE)

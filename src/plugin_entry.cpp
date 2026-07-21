@@ -55,9 +55,9 @@ int32_t GuardAbiCall(
 RagbagSubtitleDecoderDescriptorV1 const g_decoder_descriptor = {
 	sizeof(RagbagSubtitleDecoderDescriptorV1),
 	"ragbag.pgs",
-	"Ragbag PGS Decoder",
-	"Ragbag/PGS",
-	"hdmv-pgs"
+	"Ragbag FFmpeg Bitmap Subtitle Decoder",
+	"Ragbag/FFmpeg Bitmap",
+	"hdmv-pgs;dvd-subtitle"
 };
 
 void Log(RagbagSubtitleLogLevelV1 level, char const *message) {
@@ -175,7 +175,7 @@ RAGBAG_SUBTITLE_PLUGIN_EXPORT int32_t ragbag_subtitle_decoder_init_v1(
 		plugin->struct_size = sizeof(RagbagSubtitlePluginApiV1);
 		plugin->api_version = RAGBAG_SUBTITLE_DECODER_API_VERSION;
 		plugin->plugin_id = "org.ragbag.subtitle.pgs";
-		plugin->plugin_name = "Ragbag PGS Subtitle Decoder";
+		plugin->plugin_name = "Ragbag FFmpeg Bitmap Subtitle Decoder";
 		plugin->plugin_version = "0.2.0-dev";
 		plugin->plugin_license = "LGPL-2.1-or-later (plugin glue and statically linked FFmpeg)";
 		plugin->get_decoder_count = GetDecoderCount;
@@ -188,7 +188,7 @@ RAGBAG_SUBTITLE_PLUGIN_EXPORT int32_t ragbag_subtitle_decoder_init_v1(
 		plugin->end_stream = EndStream;
 		plugin->render_at = RenderAt;
 
-		Log(RAGBAG_SUBTITLE_LOG_INFO, "Initialized Ragbag packet-backed PGS decoder.");
+		Log(RAGBAG_SUBTITLE_LOG_INFO, "Initialized Ragbag packet-backed PGS/VobSub decoder.");
 		return RAGBAG_SUBTITLE_STATUS_OK;
 	});
 }

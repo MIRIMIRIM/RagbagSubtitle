@@ -88,6 +88,26 @@ std::string AvError(int error_code) {
 
 constexpr AVRational kNanosecondTimeBase = { 1, 1000000000 };
 
+struct SupportedCodec {
+    char const *stable_id;
+    AVCodecID codec_id;
+};
+
+constexpr SupportedCodec kSupportedCodecs[] = {
+    { "hdmv-pgs", AV_CODEC_ID_HDMV_PGS_SUBTITLE },
+    { "dvd-subtitle", AV_CODEC_ID_DVD_SUBTITLE },
+};
+
+SupportedCodec const *FindSupportedCodec(char const *stable_id) {
+    if (!stable_id)
+        return nullptr;
+    for (auto const& codec : kSupportedCodecs) {
+        if (std::strcmp(codec.stable_id, stable_id) == 0)
+            return &codec;
+    }
+    return nullptr;
+}
+
 int64_t NsToAvTime(int64_t value) {
     if (value == RAGBAG_SUBTITLE_TIMESTAMP_UNKNOWN)
         return AV_NOPTS_VALUE;
@@ -323,6 +343,7 @@ class FfmpegBitmapSubtitleDecoderImpl final : public FfmpegBitmapSubtitleDecoder
     std::vector<uint8_t> codec_private;
     int fallback_canvas_width = 0;
     int fallback_canvas_height = 0;
+    AVCodecID codec_id = AV_CODEC_ID_NONE;
     bool stream_finished = false;
 
     int SetError(RagbagSubtitleStatusV1 status, std::string message) {
@@ -331,15 +352,23 @@ class FfmpegBitmapSubtitleDecoderImpl final : public FfmpegBitmapSubtitleDecoder
     }
 
     int OpenCodecContext(RagbagSubtitleStatusV1 failure_status, char const *action) {
-        AVCodec const *decoder = avcodec_find_decoder(AV_CODEC_ID_HDMV_PGS_SUBTITLE);
+        AVCodec const *decoder = avcodec_find_decoder(codec_id);
         if (!decoder)
-            return SetError(failure_status, std::string(action) + ": FFmpeg PGS subtitle decoder is unavailable.");
+            return SetError(failure_status, std::string(action) + ": FFmpeg bitmap subtitle decoder is unavailable.");
 
         CodecContextPtr next_codec(avcodec_alloc_context3(decoder));
         if (!next_codec)
             return SetError(failure_status, std::string(action) + ": failed to allocate FFmpeg codec context.");
 
         next_codec->pkt_timebase = AV_TIME_BASE_Q;
+        if (codec_id == AV_CODEC_ID_DVD_SUBTITLE
+            && fallback_canvas_width > 0 && fallback_canvas_height > 0) {
+            // DVD/VobSub SPUs carry rectangle coordinates but no canvas size.
+            // Keep the host fallback available unless IDX/Matroska extradata
+            // supplies an authoritative size line during codec init.
+            next_codec->width = fallback_canvas_width;
+            next_codec->height = fallback_canvas_height;
+        }
         if (!codec_private.empty()) {
             auto const allocation_size = codec_private.size() + AV_INPUT_BUFFER_PADDING_SIZE;
             next_codec->extradata = static_cast<uint8_t *>(av_mallocz(allocation_size));
@@ -390,8 +419,8 @@ class FfmpegBitmapSubtitleDecoderImpl final : public FfmpegBitmapSubtitleDecoder
             event.end_ns = SaturatingAdd(event.start_ns, AvTimeToNs(packet->duration));
         }
 
-        // The PGS presentation composition segment is authoritative for the
-        // authored canvas. FFmpeg publishes it on AVCodecContext while decoding.
+        // PGS publishes its composition canvas while DVD/VobSub obtains it
+        // from size metadata in codec private data or the host fallback above.
         event.authored_width = codec->width > 0 ? codec->width : fallback_canvas_width;
         event.authored_height = codec->height > 0 ? codec->height : fallback_canvas_height;
 
@@ -429,10 +458,13 @@ public:
         last_error.clear();
         fallback_canvas_width = 0;
         fallback_canvas_height = 0;
+        codec_id = AV_CODEC_ID_NONE;
         stream_finished = false;
 
-        if (!stream || stream->struct_size < sizeof(RagbagSubtitleStreamInfoV1)
-            || !stream->codec_id || std::strcmp(stream->codec_id, "hdmv-pgs") != 0) {
+        auto const *supported_codec = stream && stream->struct_size >= sizeof(RagbagSubtitleStreamInfoV1)
+            ? FindSupportedCodec(stream->codec_id)
+            : nullptr;
+        if (!supported_codec) {
             return SetError(RAGBAG_SUBTITLE_STATUS_INVALID_ARGUMENT, "Unsupported or invalid bitmap subtitle stream.");
         }
         if ((!stream->codec_private && stream->codec_private_size > 0)
@@ -442,6 +474,7 @@ public:
 
         fallback_canvas_width = std::max(stream->fallback_canvas_width, 0);
         fallback_canvas_height = std::max(stream->fallback_canvas_height, 0);
+        codec_id = supported_codec->codec_id;
 
         if (stream->codec_private_size > 0) {
             codec_private.assign(

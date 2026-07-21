@@ -5,8 +5,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <iterator>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -94,12 +96,21 @@ int main(int argc, char **argv) {
 	std::cout << "plugin.version=" << (plugin.plugin_version ? plugin.plugin_version : "") << '\n';
 	uint32_t const count = plugin.get_decoder_count ? plugin.get_decoder_count() : 0;
 	std::cout << "decoder.count=" << count << '\n';
+	bool advertises_vobsub = false;
 	for (uint32_t index = 0; index < count; ++index) {
 		auto const *descriptor = plugin.get_decoder_descriptor(index);
 		if (!descriptor)
 			continue;
 		std::cout << "decoder[" << index << "].id=" << (descriptor->decoder_id ? descriptor->decoder_id : "") << '\n';
 		std::cout << "decoder[" << index << "].codecs=" << (descriptor->codec_ids_semicolon ? descriptor->codec_ids_semicolon : "") << '\n';
+		advertises_vobsub = advertises_vobsub
+			|| (descriptor->codec_ids_semicolon
+				&& std::strstr(descriptor->codec_ids_semicolon, "dvd-subtitle"));
+	}
+	if (!advertises_vobsub) {
+		std::cerr << "decoder descriptor does not advertise dvd-subtitle\n";
+		CloseLibrary(library);
+		return 1;
 	}
 
 	if (count > 0) {
@@ -273,6 +284,91 @@ int main(int argc, char **argv) {
 			return 1;
 		}
 		std::cout << "decoder.smoke=ok\n";
+
+		RagbagSubtitleDecoderV1 *vobsub_decoder = nullptr;
+		auto vobsub_status = plugin.create_decoder(descriptor->decoder_id, &vobsub_decoder);
+		static char const vobsub_codec_private[] =
+			"size: 720x480\n"
+			"palette: 000000, ff0000, 00ff00, 0000ff, ffffff, 808080, 800000, 008000,"
+			" 000080, 808000, 800080, 008080, c0c0c0, ff8080, 80ff80, 8080ff\n";
+		RagbagSubtitleStreamInfoV1 vobsub_stream = {};
+		vobsub_stream.struct_size = sizeof(vobsub_stream);
+		vobsub_stream.codec_id = "dvd-subtitle";
+		vobsub_stream.codec_private = reinterpret_cast<uint8_t const *>(vobsub_codec_private);
+		vobsub_stream.codec_private_size = sizeof(vobsub_codec_private) - 1;
+		if (vobsub_status == RAGBAG_SUBTITLE_STATUS_OK)
+			vobsub_status = plugin.begin_stream(vobsub_decoder, &vobsub_stream);
+
+		// Complete raw DVD SPU after the host has removed the IDX/SUB MPEG-PS
+		// envelope. It contains one opaque red 2x2 bitmap displayed for 1024 ms.
+		static uint8_t const vobsub_spu[] = {
+			0x00, 0x24, 0x00, 0x06, 0x90, 0x90,
+			0x00, 0x00, 0x00, 0x1e,
+			0x03, 0x00, 0x10,
+			0x04, 0x00, 0xf0,
+			0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01,
+			0x06, 0x00, 0x04, 0x00, 0x05,
+			0x01, 0xff,
+			0x00, 0x5a, 0x00, 0x1e, 0x02, 0xff
+		};
+		RagbagSubtitlePacketV1 vobsub_packet = {};
+		vobsub_packet.struct_size = sizeof(vobsub_packet);
+		vobsub_packet.pts_ns = 1000000000;
+		vobsub_packet.dts_ns = RAGBAG_SUBTITLE_TIMESTAMP_UNKNOWN;
+		vobsub_packet.payload = vobsub_spu;
+		vobsub_packet.payload_size = sizeof(vobsub_spu);
+		if (vobsub_status == RAGBAG_SUBTITLE_STATUS_OK)
+			vobsub_status = plugin.push_packet(vobsub_decoder, &vobsub_packet);
+		if (vobsub_status == RAGBAG_SUBTITLE_STATUS_OK)
+			vobsub_status = plugin.end_stream(vobsub_decoder);
+
+		std::vector<uint8_t> vobsub_pixels(720 * 480 * 4, uint8_t{0x7d});
+		RagbagSubtitleRenderTargetV1 vobsub_target = {};
+		vobsub_target.struct_size = sizeof(vobsub_target);
+		vobsub_target.plane0 = vobsub_pixels.data();
+		vobsub_target.stride0 = 720 * 4;
+		vobsub_target.width = 720;
+		vobsub_target.height = 480;
+		RagbagSubtitleRenderResultV1 vobsub_result = {};
+		vobsub_result.struct_size = sizeof(vobsub_result);
+		if (vobsub_status == RAGBAG_SUBTITLE_STATUS_OK) {
+			vobsub_status = plugin.render_at(
+				vobsub_decoder, 1500000000, &vobsub_target, &vobsub_result);
+		}
+
+		bool vobsub_red_bitmap = true;
+		for (int y = 0; y < 2; ++y) {
+			for (int x = 0; x < 2; ++x) {
+				auto const *pixel = vobsub_pixels.data()
+					+ static_cast<size_t>(y * vobsub_target.stride0 + x * 4);
+				vobsub_red_bitmap = vobsub_red_bitmap
+					&& pixel[0] == 0x00 && pixel[1] == 0x00
+					&& pixel[2] == 0xff && pixel[3] == 0xff;
+			}
+		}
+		auto const *outside_vobsub = vobsub_pixels.data() + 2 * 4;
+		bool const vobsub_background_clear = std::all_of(
+			outside_vobsub, outside_vobsub + 4,
+			[](uint8_t value) { return value == 0; });
+		if (plugin.destroy_decoder)
+			plugin.destroy_decoder(vobsub_decoder);
+
+		if (vobsub_status != RAGBAG_SUBTITLE_STATUS_OK
+			|| vobsub_result.has_visible_content == 0
+			|| vobsub_result.authored_width != 720 || vobsub_result.authored_height != 480
+			|| vobsub_result.valid_until_ns != 2024000000
+			|| !vobsub_red_bitmap || !vobsub_background_clear) {
+			std::cerr << "VobSub smoke test failed: status=" << vobsub_status
+				<< " visible=" << vobsub_result.has_visible_content
+				<< " canvas=" << vobsub_result.authored_width << 'x' << vobsub_result.authored_height
+				<< " valid_until=" << vobsub_result.valid_until_ns
+				<< " red=" << vobsub_red_bitmap
+				<< " background_clear=" << vobsub_background_clear
+				<< '\n';
+			CloseLibrary(library);
+			return 1;
+		}
+		std::cout << "decoder.vobsub.smoke=ok\n";
 	}
 
 	CloseLibrary(library);
