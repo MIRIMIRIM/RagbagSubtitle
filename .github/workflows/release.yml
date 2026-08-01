@@ -1,15 +1,10 @@
-# Manually build an existing git tag, upload artifacts, and publish a GitHub Release.
-#
-#   git tag 0.2.0 && git push origin 0.2.0
-#   Actions → Release → Run workflow → enter tag
-
 name: Release
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing git tag to build and publish (e.g. 0.2.0)"
+        description: "Existing git tag to build and publish (e.g. v0.2.0)"
         required: true
         type: string
 
@@ -124,49 +119,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path $stage, dist | Out-Null
 
           Copy-Item -Force "${{ steps.locate.outputs.dll }}" $stage
-          Copy-Item -Force LICENSE, README.md, vcpkg.json $stage
           Copy-Item -Force include/ragbag/subtitle_plugin_api.h $stage
-
-          $notice = @"
-          RagbagSubtitle binary release ($tag)
-          =====================================
-
-          Contents
-          --------
-          - ragbag-subtitle-ffmpeg.dll
-            Single Windows x64 plugin DLL. FFmpeg (libavcodec/libavutil) is
-            statically linked via the vcpkg x64-windows-static triplet. Host
-            applications should place this file under their executable-relative
-            runtimes directory.
-          - subtitle_plugin_api.h
-            Public C plugin ABI header.
-          - LICENSE
-            GNU Lesser General Public License v2.1 (or later).
-          - README.md, vcpkg.json
-            Build and dependency notes for this tag.
-
-          License / FFmpeg (LGPL)
-          -----------------------
-          This plugin and the statically linked FFmpeg components are
-          distributed under LGPL-2.1-or-later. The combined DLL is an
-          LGPL-covered work.
-
-          Corresponding source for RagbagSubtitle is this repository at tag
-          $tag. Corresponding source for FFmpeg is obtained by resolving the
-          ffmpeg version pinned by the vcpkg port used when building this
-          artifact (see the build log / vcpkg install tree for the exact
-          version), or from https://ffmpeg.org/ and
-          https://github.com/FFmpeg/FFmpeg.
-
-          Written offer (LGPL section 6c): for at least three years after
-          publication of this binary, the copyright holders will provide
-          complete corresponding source for the LGPL-covered components in
-          this package upon request, at no more than the cost of distribution.
-          Contact the repository maintainers via GitHub Issues on
-          https://github.com/$repo.
-          "@
-          $notice = ($notice -split "`n" | ForEach-Object { $_ -replace '^          ', '' }) -join "`n"
-          Set-Content -Path "$stage/NOTICE.txt" -Value $notice -Encoding utf8
+          Copy-Item -Force "LICENSE" $stage
 
           if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
           Compress-Archive -Path "$stage/*" -DestinationPath $zipPath -CompressionLevel Optimal
@@ -196,17 +150,6 @@ jobs:
           prerelease: ${{ contains(inputs.tag, '-') }}
           generate_release_notes: true
           fail_on_unmatched_files: true
-          body: |
-            Windows x64 build of the `ragbag-subtitle-ffmpeg` plugin for tag `${{ inputs.tag }}`.
-
-            ### Assets
-            - `ragbag-subtitle-ffmpeg-windows-x64-*.zip` — plugin DLL, ABI header, LICENSE, NOTICE
-            - matching `.sha256` checksum
-
-            ### Notes
-            - FFmpeg (`libavcodec` / `libavutil`) is **statically linked** (`x64-windows-static`).
-            - Place `ragbag-subtitle-ffmpeg.dll` under Aegisub's executable-relative `runtimes/` directory.
-            - Licensed under **LGPL-2.1-or-later**; see `LICENSE` and `NOTICE.txt` inside the zip.
           files: |
             dist/*.zip
             dist/*.sha256
