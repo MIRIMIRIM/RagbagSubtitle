@@ -2,6 +2,7 @@
   "name": "ragbag-subtitle",
   "version-string": "0.2.0-dev",
   "description": "Packet-backed bitmap subtitle decoder for Aegisub.",
+  "builtin-baseline": "39344dff01c5a5a0134caf2624cdd492f05d30ea",
   "dependencies": [
     {
       "name": "ffmpeg",

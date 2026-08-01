@@ -20,14 +20,17 @@ env:
   BUILD_CONFIG: Release
   VCPKG_ROOT: ${{ github.workspace }}/vcpkg
   VCPKG_TARGET_TRIPLET: x64-windows-static
-  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
-  VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-binary-cache
+  VCPKG_BINARY_CACHE_DIR: ${{ github.workspace }}/vcpkg-binary-cache
+  VCPKG_COMMIT: 39344dff01c5a5a0134caf2624cdd492f05d30ea
 
 jobs:
   windows:
     name: Build & publish (Windows x64)
     runs-on: windows-latest
     timeout-minutes: 180
+    env:
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg-binary-cache,readwrite
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-binary-cache
 
     steps:
       - name: Checkout tag
@@ -43,37 +46,35 @@ jobs:
           echo "HEAD: $(git rev-parse HEAD)"
           git describe --tags --exact-match HEAD
 
-      - name: Enable GitHub Actions cache for vcpkg
-        uses: actions/github-script@v9
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
       - name: Prepare vcpkg binary cache directory
         shell: pwsh
-        run: New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+        run: New-Item -ItemType Directory -Force -Path $env:VCPKG_BINARY_CACHE_DIR | Out-Null
 
-      - name: Cache vcpkg tool and downloads
+      - name: Cache vcpkg binary packages
         uses: actions/cache@v6
         with:
-          path: |
-            ${{ env.VCPKG_ROOT }}
-            ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
-          key: vcpkg-${{ runner.os }}-${{ env.VCPKG_TARGET_TRIPLET }}-${{ hashFiles('vcpkg.json') }}
+          path: ${{ env.VCPKG_BINARY_CACHE_DIR }}
+          key: vcpkg-bin-${{ runner.os }}-${{ env.VCPKG_TARGET_TRIPLET }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json') }}
           restore-keys: |
-            vcpkg-${{ runner.os }}-${{ env.VCPKG_TARGET_TRIPLET }}-
+            vcpkg-bin-${{ runner.os }}-${{ env.VCPKG_TARGET_TRIPLET }}-${{ env.VCPKG_COMMIT }}-
+            vcpkg-bin-${{ runner.os }}-${{ env.VCPKG_TARGET_TRIPLET }}-
+          save-always: true
 
       - name: Bootstrap vcpkg
         shell: pwsh
         run: |
-          if (-not (Test-Path "$env:VCPKG_ROOT/vcpkg.exe")) {
-            git clone --depth 1 https://github.com/microsoft/vcpkg.git "$env:VCPKG_ROOT"
-            & "$env:VCPKG_ROOT/bootstrap-vcpkg.bat" -disableMetrics
-          } else {
-            Write-Host "Using cached vcpkg at $env:VCPKG_ROOT"
+          $ErrorActionPreference = "Stop"
+          if (Test-Path $env:VCPKG_ROOT) {
+            Remove-Item -Recurse -Force $env:VCPKG_ROOT
           }
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_ROOT | Out-Null
+          git -C $env:VCPKG_ROOT init
+          git -C $env:VCPKG_ROOT remote add origin https://github.com/microsoft/vcpkg.git
+          git -C $env:VCPKG_ROOT fetch --depth 1 origin $env:VCPKG_COMMIT
+          git -C $env:VCPKG_ROOT checkout FETCH_HEAD
+          & "$env:VCPKG_ROOT/bootstrap-vcpkg.bat" -disableMetrics
           & "$env:VCPKG_ROOT/vcpkg.exe" version
+          Write-Host "VCPKG_BINARY_SOURCES=$env:VCPKG_BINARY_SOURCES"
 
       - name: Configure (CMake + vcpkg manifest)
         shell: pwsh
@@ -109,8 +110,8 @@ jobs:
       - name: Package release assets
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $tag = "${{ inputs.tag }}"
-          $repo = "${{ github.repository }}"
           $safeTag = $tag -replace '[\\/:*?"<>|]', '_'
           $stage = "dist/stage"
           $zipName = "ragbag-subtitle-ffmpeg-windows-x64-$safeTag.zip"
@@ -120,7 +121,12 @@ jobs:
 
           Copy-Item -Force "${{ steps.locate.outputs.dll }}" $stage
           Copy-Item -Force include/ragbag/subtitle_plugin_api.h $stage
-          Copy-Item -Force "LICENSE" $stage
+          # Older tags (e.g. v0.2.0) may not contain LICENSE; keep packaging resilient.
+          if (Test-Path "LICENSE") {
+            Copy-Item -Force "LICENSE" $stage
+          } else {
+            Write-Warning "LICENSE not present in this tag checkout; packaging without it."
+          }
 
           if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
           Compress-Archive -Path "$stage/*" -DestinationPath $zipPath -CompressionLevel Optimal
@@ -130,6 +136,7 @@ jobs:
             Set-Content -Path "dist/$zipName.sha256" -Encoding ascii
 
           Get-ChildItem dist | Format-Table Name, Length -AutoSize
+          Get-ChildItem $stage | Format-Table Name, Length -AutoSize
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v7
@@ -146,7 +153,6 @@ jobs:
         with:
           tag_name: ${{ inputs.tag }}
           name: RagbagSubtitle ${{ inputs.tag }}
-          # Tags like 0.2.0-dev / 1.0.0-rc1 are marked pre-release automatically.
           prerelease: ${{ contains(inputs.tag, '-') }}
           generate_release_notes: true
           fail_on_unmatched_files: true
